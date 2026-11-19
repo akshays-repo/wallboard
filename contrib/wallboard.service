@@ -1,0 +1,13 @@
+[Unit]
+Description=wallboard home screen (niri background layer)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+ExecStart=%h/.local/bin/wallboard
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
