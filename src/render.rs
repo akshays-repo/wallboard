@@ -10,9 +10,9 @@ use crate::board::{
 use crate::camera::Camera;
 use crate::editor::{lines_of, scroll_x, style_of, EditTarget, Editor};
 use crate::layout::{
-    area_geom, handles, note_geom, radius, text_geom, AreaGeom, Overlay, Rect as LRect, Sel, Tool,
-    ViewBtn, BODY_LINE_H, CIRCLE, NOTE_LINE_H, NOTE_RADIUS, NOTE_TITLE_H, PAD, ROW_H, TEXT_GAP,
-    TEXT_LINE_H,
+    area_geom, connector_path, handles, note_geom, radius, text_geom, AreaGeom, Overlay,
+    Rect as LRect, Sel, Tool, ViewBtn, BODY_LINE_H, CIRCLE, NOTE_LINE_H, NOTE_RADIUS, NOTE_TITLE_H,
+    PAD, ROW_H, TEXT_GAP, TEXT_LINE_H,
 };
 use crate::text::{blit, line_of, quantize_px, Face, Fonts, Style, MIN_GLYPH_PX};
 use tiny_skia::{
@@ -216,7 +216,12 @@ pub fn draw(
 
     // Shapes sit under the cards so cards stay clickable on top of them.
     for s in &scene.board.shapes {
-        draw_shape(&mut pm, &v, s, &c);
+        draw_shape(&mut pm, &v, fonts, s, &c);
+    }
+    for cn in &scene.board.connectors {
+        let f: &Fonts = fonts;
+        let path = connector_path(scene.board, cn, &|s, ch| f.advance(s.face(), ch, s.size()));
+        draw_connector(&mut pm, &v, &path, cn.color, &c);
     }
     for (ai, a) in scene.board.areas.iter().enumerate() {
         draw_area(&mut pm, &v, fonts, a, ai, scene, &c);
@@ -451,6 +456,49 @@ fn caret_for(
     Some((v.x(tx + cx - scroll), v.y(cy), h))
 }
 
+/// Highlight of the selected text of the field being edited (drawn under the caret).
+fn draw_text_sel(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &Fonts,
+    scene: &Scene,
+    target: EditTarget,
+    g_text: Option<(f32, f32, f32)>,
+    color: Rgb,
+) {
+    let Some((s0, e0)) = scene.editor.selection() else {
+        return;
+    };
+    let Some(text) = crate::editor::text_of(scene.board, target) else {
+        return;
+    };
+    let text: Vec<char> = text.chars().collect();
+    let (s0, e0) = (s0.min(text.len()), e0.min(text.len()));
+    let style = style_of(scene.board, target);
+    let adv = |s: Style, ch: char| fonts.advance(s.face(), ch, s.size());
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    match lines_of(scene.board, target, &adv) {
+        Some(lines) => {
+            for l in &lines {
+                let (a, b) = (s0.max(l.start), e0.min(l.end));
+                if a < b {
+                    spans.push((a, b));
+                }
+            }
+        }
+        None => spans.push((s0, e0)),
+    }
+    for (a, b) in spans {
+        let Some((x, cy, h)) = caret_for(v, fonts, scene.board, target, a, g_text) else {
+            continue;
+        };
+        let w: f32 = text[a..b].iter().map(|&ch| adv(style, ch)).sum::<f32>() * v.z;
+        if let Some(r) = Rect::from_xywh(x, cy - h / 2.0, w, h) {
+            pm.fill_rect(r, &paint(color, 0x66, false), Transform::identity(), None);
+        }
+    }
+}
+
 fn draw_caret(pm: &mut PixmapMut, v: &View, x: f32, cy: f32, h: f32, color: Rgb) {
     let w = (1.5 * v.z).max(v.scale);
     if let Some(r) = Rect::from_xywh(x, cy - h / 2.0, w, h) {
@@ -515,6 +563,15 @@ fn draw_area(
             c.text,
             t_clip,
             false,
+        );
+        draw_text_sel(
+            pm,
+            v,
+            fonts,
+            scene,
+            e.target,
+            Some((g.title.x, g.header.y + g.header.h / 2.0, g.title.w)),
+            c.accent[0],
         );
         if let Some((x, cy2, h)) = caret_for(
             v,
@@ -621,6 +678,15 @@ fn draw_area(
                 clip,
                 t.done,
             );
+            draw_text_sel(
+                pm,
+                v,
+                fonts,
+                scene,
+                e.target,
+                Some((row.text.x, row.rect.y + ROW_H / 2.0, row.text.w)),
+                c.accent[0],
+            );
             if let Some((x, cy2, h)) = caret_for(
                 v,
                 fonts,
@@ -689,6 +755,15 @@ fn draw_area(
             let editing_body = editing.is_some_and(|e| e.target == EditTarget::TodoBody(a.id, ri));
             if editing_body {
                 let e = editing.unwrap();
+                draw_text_sel(
+                    pm,
+                    v,
+                    fonts,
+                    scene,
+                    e.target,
+                    Some((body.rect.x, body.rect.y, BODY_LINE_H)),
+                    c.accent[0],
+                );
                 if let Some((x, cy2, h)) = caret_for(
                     v,
                     fonts,
@@ -830,6 +905,15 @@ fn draw_note(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, n: &Note, scene: &
             clip_t,
             false,
         );
+        draw_text_sel(
+            pm,
+            v,
+            fonts,
+            scene,
+            e.target,
+            Some((g.title.x, g.title.y + NOTE_TITLE_H / 2.0, g.title.w)),
+            c.accent[0],
+        );
         if let Some((cx, cy, h)) = caret_for(
             v,
             fonts,
@@ -920,6 +1004,15 @@ fn draw_note(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, n: &Note, scene: &
     }
     if editing_body {
         let e = editing.unwrap();
+        draw_text_sel(
+            pm,
+            v,
+            fonts,
+            scene,
+            e.target,
+            Some((g.body.rect.x, g.body.rect.y, NOTE_LINE_H)),
+            c.accent[0],
+        );
         if let Some((cx, cy, h)) = caret_for(
             v,
             fonts,
@@ -934,21 +1027,29 @@ fn draw_note(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, n: &Note, scene: &
 }
 
 fn draw_stroke(pm: &mut PixmapMut, v: &View, s: &Stroke, c: &Colors) {
-    let pts: Vec<(f32, f32)> = s.pts.iter().map(|&(x, y)| (v.x(x), v.y(y))).collect();
-    let Some(&first) = pts.first() else {
+    // Cull before allocating: only strokes that touch the screen get their points mapped.
+    let Some(&first) = s.pts.first() else {
         return;
     };
     let (mut x0, mut y0, mut x1, mut y1) = (first.0, first.1, first.0, first.1);
-    for p in &pts {
+    for p in &s.pts {
         x0 = x0.min(p.0);
         y0 = y0.min(p.1);
         x1 = x1.max(p.0);
         y1 = y1.max(p.1);
     }
     let pad = s.width * v.z + 2.0;
-    if !v.visible(x0 - pad, y0 - pad, x1 - x0 + 2.0 * pad, y1 - y0 + 2.0 * pad) {
+    let (sx0, sy0) = (v.x(x0), v.y(y0));
+    if !v.visible(
+        sx0 - pad,
+        sy0 - pad,
+        (x1 - x0) * v.z + 2.0 * pad,
+        (y1 - y0) * v.z + 2.0 * pad,
+    ) {
         return;
     }
+    let pts: Vec<(f32, f32)> = s.pts.iter().map(|&(x, y)| (v.x(x), v.y(y))).collect();
+    let first = pts[0];
     let mut pb = PathBuilder::new();
     pb.move_to(first.0, first.1);
     for p in &pts[1..] {
@@ -975,7 +1076,7 @@ fn draw_stroke(pm: &mut PixmapMut, v: &View, s: &Stroke, c: &Colors) {
     }
 }
 
-fn draw_shape(pm: &mut PixmapMut, v: &View, s: &Shape, c: &Colors) {
+fn draw_shape(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, s: &Shape, c: &Colors) {
     let col = c.accent[s.color as usize % 10];
     let tf = Transform::identity();
     let width = (2.5 * v.z).max(v.hair() * 1.5);
@@ -990,7 +1091,12 @@ fn draw_shape(pm: &mut PixmapMut, v: &View, s: &Shape, c: &Colors) {
     if !v.visible(x - width, y - width, w + 2.0 * width, h + 2.0 * width) {
         return;
     }
+    if matches!(s.kind, ShapeKind::Image | ShapeKind::Sticker) {
+        draw_picture(pm, v, fonts, s, (x, y, w, h), col);
+        return;
+    }
     let path = match s.kind {
+        ShapeKind::Image | ShapeKind::Sticker => None,
         ShapeKind::Rect => rounded_rect(x, y, w.max(1.0), h.max(1.0), 6.0 * v.z),
         ShapeKind::Ellipse => {
             Rect::from_xywh(x, y, w.max(1.0), h.max(1.0)).and_then(PathBuilder::from_oval)
@@ -1009,6 +1115,115 @@ fn draw_shape(pm: &mut PixmapMut, v: &View, s: &Shape, c: &Colors) {
         pm.fill_path(&p, &paint(col, 30, true), FillRule::Winding, tf, None);
     }
     pm.stroke_path(&p, &paint(col, 0xff, true), &stroke, tf, None);
+}
+
+/// An image or an emoji sticker inside its box (screen px).
+fn draw_picture(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    s: &Shape,
+    (x, y, w, h): (f32, f32, f32, f32),
+    col: Rgb,
+) {
+    if w < 1.0 || h < 1.0 {
+        return;
+    }
+    if s.kind == ShapeKind::Image {
+        if let Some(img) = fonts.pics.image(&s.src) {
+            let t = Transform::from_row(
+                w / img.width() as f32,
+                0.0,
+                0.0,
+                h / img.height() as f32,
+                x,
+                y,
+            );
+            let paint = PixmapPaint {
+                quality: FilterQuality::Bilinear,
+                ..PixmapPaint::default()
+            };
+            pm.draw_pixmap(0, 0, img.as_ref(), &paint, t, None);
+            return;
+        }
+    } else {
+        let px = quantize_px(w.min(h) * 0.9);
+        if let Some(g) = fonts.pics.emoji(&s.src, px) {
+            let (gx, gy) = (x + (w - g.w as f32) / 2.0, y + (h - g.h as f32) / 2.0);
+            let (cw, ch) = (pm.width() as i32, pm.height() as i32);
+            blit(pm.data_mut(), cw, ch, g, gx as i32, gy as i32, col, (0, cw));
+            return;
+        }
+    }
+    // Missing image or no emoji font: an outlined box so the item can still be found.
+    if let Some(p) = rounded_rect(x, y, w, h, 6.0 * v.z) {
+        let st = SkStroke {
+            width: v.hair(),
+            ..SkStroke::default()
+        };
+        pm.stroke_path(
+            &p,
+            &paint(col, 0xff, true),
+            &st,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+/// A connector arrow: the routed polyline with an arrowhead at its end.
+fn draw_connector(pm: &mut PixmapMut, v: &View, path: &[(f32, f32)], color: u8, c: &Colors) {
+    let pts: Vec<(f32, f32)> = path.iter().map(|&(x, y)| (v.x(x), v.y(y))).collect();
+    if pts.len() < 2 {
+        return;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (pts[0].0, pts[0].1, pts[0].0, pts[0].1);
+    for p in &pts {
+        (x0, y0, x1, y1) = (x0.min(p.0), y0.min(p.1), x1.max(p.0), y1.max(p.1));
+    }
+    let pad = 16.0 * v.z + 4.0;
+    if !v.visible(x0 - pad, y0 - pad, x1 - x0 + 2.0 * pad, y1 - y0 + 2.0 * pad) {
+        return;
+    }
+    let col = c.accent[color as usize % 10];
+    let width = (2.5 * v.z).max(v.hair() * 1.5);
+    let stroke = SkStroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..SkStroke::default()
+    };
+    let tf = Transform::identity();
+    // Stop the line a little short so the round cap does not poke through the arrowhead.
+    let n = pts.len();
+    let (tip, prev) = (pts[n - 1], pts[n - 2]);
+    let (dx, dy) = (tip.0 - prev.0, tip.1 - prev.1);
+    let len = dx.hypot(dy).max(0.001);
+    let (ux, uy) = (dx / len, dy / len);
+    let head = (11.0 * v.z).max(6.0);
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts[0].0, pts[0].1);
+    for p in &pts[1..n - 1] {
+        pb.line_to(p.0, p.1);
+    }
+    pb.line_to(tip.0 - ux * head * 0.6, tip.1 - uy * head * 0.6);
+    if let Some(p) = pb.finish() {
+        pm.stroke_path(&p, &paint(col, 0xff, true), &stroke, tf, None);
+    }
+    let mut hb = PathBuilder::new();
+    hb.move_to(tip.0, tip.1);
+    hb.line_to(
+        tip.0 - ux * head + uy * head * 0.45,
+        tip.1 - uy * head - ux * head * 0.45,
+    );
+    hb.line_to(
+        tip.0 - ux * head - uy * head * 0.45,
+        tip.1 - uy * head + ux * head * 0.45,
+    );
+    hb.close();
+    if let Some(p) = hb.finish() {
+        pm.fill_path(&p, &paint(col, 0xff, true), FillRule::Winding, tf, None);
+    }
 }
 
 fn draw_free_text(
@@ -1069,6 +1284,15 @@ fn draw_free_text(
                     None,
                 );
             }
+            draw_text_sel(
+                pm,
+                v,
+                fonts,
+                scene,
+                e.target,
+                Some((t.x, t.y, TEXT_LINE_H)),
+                c.accent[0],
+            );
             if let Some((cx, cy, ch)) = caret_for(
                 v,
                 fonts,
@@ -1121,7 +1345,7 @@ fn draw_selection(pm: &mut PixmapMut, v: &View, fonts: &Fonts, scene: &Scene, c:
         }
     }
     // A thin outline around cards, notes and texts (shapes already show their own edge).
-    if !matches!(sel, Sel::Shape(_)) && scene.editor.editing.is_none() {
+    if !matches!(sel, Sel::Shape(_) | Sel::Connector(_)) && scene.editor.editing.is_none() {
         if let Some(r) = crate::layout::selection_rect(scene.board, sel, &adv) {
             let (x, y, w, h) = v.rect(r);
             if let Some(p) = rounded_rect(
@@ -1268,11 +1492,13 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
     }
 }
 
-const HELP_LEFT: [(&str, &str); 14] = [
+const HELP_LEFT: [(&str, &str); 18] = [
     ("V", "Select"),
     ("G", "Group card tool"),
     ("T", "Todo tool"),
     ("N", "Note tool"),
+    ("S", "Sticker tool"),
+    ("M", "Paste image"),
     ("X", "Text tool"),
     ("R / O / I", "Rectangle / ellipse / line"),
     ("P / E", "Pen / eraser"),
@@ -1281,15 +1507,18 @@ const HELP_LEFT: [(&str, &str); 14] = [
     ("+ / -", "Zoom in / out"),
     ("C", "Capture"),
     ("L", "Light / dark theme"),
-    ("B", "Cycle background"),
+    ("B", "Cycle background / wallpaper"),
+    ("W", "Wallpaper rotation"),
+    ("F / Shift+F", "Wallpaper folder: pick / open"),
     ("?", "This help"),
 ];
-const HELP_RIGHT: [(&str, &str); 14] = [
+const HELP_RIGHT: [(&str, &str); 16] = [
     ("Shift+click", "Add to selection"),
     ("Ctrl+G", "Lock selection together"),
     ("Ctrl+Shift+G", "Unlock group"),
     ("Delete", "Remove selected"),
     ("Esc", "Deselect / close"),
+    ("Ctrl+V", "Paste text / PNG image"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Y", "Redo"),
     ("Ctrl+Enter", "Toggle todo done"),
@@ -1298,6 +1527,7 @@ const HELP_RIGHT: [(&str, &str); 14] = [
     ("Right-click", "Remove item"),
     ("Scroll / drag", "Pan the canvas"),
     ("Ctrl+scroll", "Zoom"),
+    ("Dbl-click sticker", "Next emoji"),
     ("Ctrl+Q", "Quit"),
 ];
 
@@ -1355,7 +1585,7 @@ fn draw_help(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, c: &Colors) {
         full,
         false,
     );
-    for (ci, list) in [&HELP_LEFT, &HELP_RIGHT].into_iter().enumerate() {
+    for (ci, list) in [&HELP_LEFT[..], &HELP_RIGHT[..]].into_iter().enumerate() {
         let x = px + pad + ci as f32 * (col_w + pad);
         for (i, (k, d)) in list.iter().enumerate() {
             let y = py + pad + 44.0 + i as f32 * row_h;
@@ -1546,6 +1776,40 @@ fn draw_tool_icon(pm: &mut PixmapMut, v: &View, tool: Tool, cx: f32, cy: f32, co
             line(pm, &[(6.0, 6.5), (18.0, 6.5)], false);
             line(pm, &[(12.0, 6.5), (12.0, 19.0)], false);
         }
+        Tool::Sticker => {
+            // A smiley face.
+            let (px, py) = p(12.0, 12.0);
+            if let Some(path) = PathBuilder::from_circle(px, py, 8.0 * u) {
+                pm.stroke_path(&path, &paint(color, 0xff, true), &stroke, tf, None);
+            }
+            line(
+                pm,
+                &[(9.0, 14.0), (10.5, 15.5), (13.5, 15.5), (15.0, 14.0)],
+                false,
+            );
+            line(pm, &[(9.5, 10.0), (9.5, 10.2)], false);
+            line(pm, &[(14.5, 10.0), (14.5, 10.2)], false);
+        }
+        Tool::Image => {
+            // A framed picture: a sun and a hill.
+            if let Some(path) =
+                rounded_rect(ox + 4.0 * u, oy + 5.0 * u, 16.0 * u, 14.0 * u, 2.5 * u)
+            {
+                pm.stroke_path(&path, &paint(color, 0xff, true), &stroke, tf, None);
+            }
+            line(
+                pm,
+                &[
+                    (5.0, 17.0),
+                    (10.0, 12.0),
+                    (13.5, 15.0),
+                    (16.0, 13.0),
+                    (19.0, 16.5),
+                ],
+                false,
+            );
+            line(pm, &[(15.5, 9.0), (15.6, 9.1)], false);
+        }
         Tool::Rect => {
             if let Some(path) =
                 rounded_rect(ox + 4.5 * u, oy + 6.0 * u, 15.0 * u, 12.0 * u, 2.5 * u)
@@ -1561,6 +1825,11 @@ fn draw_tool_icon(pm: &mut PixmapMut, v: &View, tool: Tool, cx: f32, cy: f32, co
             }
         }
         Tool::Line => line(pm, &[(5.5, 18.5), (18.5, 5.5)], false),
+        Tool::Connector => {
+            // An elbow arrow with a head.
+            line(pm, &[(5.0, 18.0), (5.0, 8.0), (17.0, 8.0)], false);
+            line(pm, &[(13.5, 4.5), (18.0, 8.0), (13.5, 11.5)], false);
+        }
         Tool::Eraser => {
             line(
                 pm,

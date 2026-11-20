@@ -2,11 +2,11 @@
 //! undo bookkeeping. Pure logic: takes decoded input and a char-advance function, so it can be
 //! unit-tested without Wayland or fonts.
 
-use crate::board::{Board, History, ShapeKind, Todo, DEFAULT_SHAPE};
+use crate::board::{Board, End, History, ShapeKind, Todo, DEFAULT_SHAPE};
 use crate::board::{MAX_W, MIN_AREA_W, MIN_NOTE_W};
 use crate::camera::Camera;
 use crate::layout::{
-    area_geom, hit_handle, hit_test, note_geom, text_geom, Adv, Handle, Sel, Target, Tool,
+    area_geom, hit_handle, hit_test, item_at, note_geom, text_geom, Adv, Handle, Sel, Target, Tool,
     TEXT_LINE_H,
 };
 use crate::text::{index_at_x, line_of, Style};
@@ -49,6 +49,10 @@ pub enum Key {
     Home,
     End,
     Escape,
+    /// Ctrl+A
+    SelectAll,
+    /// Ctrl+X (the text goes to the clipboard via `Editor::selected_text`).
+    Cut,
 }
 
 /// The text field being edited. Areas and notes are addressed by id, todos by (area id, row).
@@ -109,6 +113,11 @@ enum Mover {
         id: u64,
         orig: (f32, f32, f32, f32),
     },
+    /// A connector's free ends (attached ends follow their items and stay put).
+    Connector {
+        id: u64,
+        orig: (f32, f32, f32, f32),
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +144,10 @@ enum Drag {
     DrawShape {
         id: u64,
     },
+    /// Dragging out a new connector arrow; its end follows the pointer.
+    Connect {
+        id: u64,
+    },
     /// Dragging a resize handle of the selected item.
     Resize {
         sel: Sel,
@@ -145,6 +158,10 @@ enum Drag {
     },
     Erase {
         recorded: bool,
+    },
+    /// Dragging the pointer over the text being edited to select it.
+    TextSelect {
+        target: EditTarget,
     },
 }
 
@@ -165,6 +182,8 @@ pub struct Editor {
     pub extra: Vec<Sel>,
     /// Shift is held (set by the app).
     pub shift: bool,
+    /// Other end of the text selection (the caret is the moving end). None: nothing selected.
+    anchor: Option<usize>,
     pub editing: Option<Edit>,
     drag: Drag,
     last_click: Option<(u32, f32, f32)>,
@@ -253,6 +272,7 @@ impl Editor {
             selected: None,
             extra: Vec::new(),
             shift: false,
+            anchor: None,
             editing: None,
             drag: Drag::None,
             last_click: None,
@@ -285,6 +305,28 @@ impl Editor {
 
     fn start_editing(&mut self, target: EditTarget, caret: usize) {
         self.editing = Some(Edit { target, caret });
+        self.anchor = None;
+    }
+
+    /// Start (or continue) editing at a click and arm drag-selection from that point.
+    fn begin_text_select(&mut self, target: EditTarget, caret: usize) {
+        self.start_editing(target, caret);
+        self.anchor = Some(caret);
+        self.drag = Drag::TextSelect { target };
+    }
+
+    /// The selected range of the edited field, as char indices (start < end).
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let e = self.editing?;
+        let a = self.anchor?;
+        (a != e.caret).then(|| (a.min(e.caret), a.max(e.caret)))
+    }
+
+    /// The selected text, for copy / cut.
+    pub fn selected_text(&self, board: &Board) -> Option<String> {
+        let (s, e) = self.selection()?;
+        let t = text_of(board, self.editing?.target)?;
+        Some(t.chars().skip(s).take(e - s).collect())
     }
 
     fn start_editing_end(&mut self, board: &Board, target: EditTarget) {
@@ -421,6 +463,53 @@ impl Editor {
     }
 
     /// New free note at a world point; its title is edited immediately.
+    /// Drop a sticker (the next emoji in the set) centred on a world point and select it.
+    pub fn add_sticker(&mut self, board: &mut Board, (wx, wy): (f32, f32)) -> u64 {
+        self.history.record(board, None);
+        let n = board
+            .shapes
+            .iter()
+            .filter(|s| s.kind == crate::board::ShapeKind::Sticker)
+            .count();
+        let e = crate::board::STICKERS[n % crate::board::STICKERS.len()];
+        let side = 96.0;
+        let id = board.add_picture(
+            crate::board::ShapeKind::Sticker,
+            e,
+            wx - side / 2.0,
+            wy - side / 2.0,
+            side,
+            side,
+        );
+        self.selected = Some(Sel::Shape(id));
+        self.modified = true;
+        id
+    }
+
+    /// Place a stored image (`name` in the images folder, `iw` x `ih` px) centred on a world point.
+    pub fn add_image(
+        &mut self,
+        board: &mut Board,
+        name: &str,
+        (iw, ih): (u32, u32),
+        (wx, wy): (f32, f32),
+    ) -> u64 {
+        self.history.record(board, None);
+        let k = (360.0 / iw.max(ih).max(1) as f32).min(1.0);
+        let (w, h) = ((iw as f32 * k).max(16.0), (ih as f32 * k).max(16.0));
+        let id = board.add_picture(
+            crate::board::ShapeKind::Image,
+            name,
+            wx - w / 2.0,
+            wy - h / 2.0,
+            w,
+            h,
+        );
+        self.selected = Some(Sel::Shape(id));
+        self.modified = true;
+        id
+    }
+
     pub fn create_note_at(&mut self, board: &mut Board, wx: f32, wy: f32) -> u64 {
         self.history.record(board, None);
         let id = board.add_note(wx, wy);
@@ -527,7 +616,15 @@ impl Editor {
                     self.modified = true;
                 }
             }
+            Target::Connector(ci) => {
+                if ci < board.connectors.len() {
+                    self.history.record(board, None);
+                    board.connectors.remove(ci);
+                    self.modified = true;
+                }
+            }
         }
+        board.prune_connectors();
         self.validate_selection(board);
         true
     }
@@ -571,10 +668,25 @@ impl Editor {
                 self.modified = true;
                 true
             }
-            Tool::Group | Tool::Note | Tool::Todo | Tool::Text => {
+            Tool::Connector => {
+                self.finish_edit(board);
+                self.history.record(board, None);
+                // Start on an item to attach to it (it then follows that item), else a free point.
+                let from = match item_at(board, wx, wy, adv) {
+                    Some(id) => End { id, x: wx, y: wy },
+                    None => End::free(wx, wy),
+                };
+                let id = board.add_connector(from, End::free(wx, wy), self.pen_color);
+                self.drag = Drag::Connect { id };
+                self.modified = true;
+                true
+            }
+            Tool::Group | Tool::Note | Tool::Todo | Tool::Text | Tool::Sticker => {
                 self.place_press(board, wx, wy, adv)
             }
-            Tool::Select => self.select_press(board, p, (wx, wy), double, cam.zoom, adv),
+            Tool::Select | Tool::Image => {
+                self.select_press(board, p, (wx, wy), double, cam.zoom, adv)
+            }
         }
     }
 
@@ -590,6 +702,9 @@ impl Editor {
             }
             Tool::Note if tgt.is_none() => {
                 self.create_note_at(board, wx, wy);
+            }
+            Tool::Sticker if tgt.is_none() => {
+                self.add_sticker(board, (wx, wy));
             }
             Tool::Text => match tgt {
                 None => {
@@ -729,7 +844,7 @@ impl Editor {
                 let (id, off) = (a.id, (wx - a.x, wy - a.y));
                 if double {
                     let caret = self.caret_for(board, EditTarget::AreaTitle(id), (wx, wy), adv);
-                    self.start_editing(EditTarget::AreaTitle(id), caret);
+                    self.begin_text_select(EditTarget::AreaTitle(id), caret);
                 } else {
                     self.drag = Drag::Pending {
                         who: Mover::Area(id),
@@ -750,7 +865,7 @@ impl Editor {
             Target::Text(..) | Target::TodoBody(..) | Target::NoteBody(_) => {
                 if let Some(t) = Self::edit_target_of(board, tgt) {
                     let caret = self.caret_for(board, t, (wx, wy), adv);
-                    self.start_editing(t, caret);
+                    self.begin_text_select(t, caret);
                 }
             }
             Target::FreeText(ti) => {
@@ -760,7 +875,7 @@ impl Editor {
                 if keep_edit {
                     let t = EditTarget::FreeText(id);
                     let caret = self.caret_for(board, t, (wx, wy), adv);
-                    self.start_editing(t, caret);
+                    self.begin_text_select(t, caret);
                 } else if let Some(t) = board.text(id) {
                     self.drag = Drag::Pending {
                         who: Mover::Text(id),
@@ -777,7 +892,14 @@ impl Editor {
                     let id = s.id;
                     self.history.record(board, None);
                     if let Some(s) = board.shape_mut(id) {
-                        s.color = (s.color + 1) % crate::board::PALETTE_LEN;
+                        if s.kind == crate::board::ShapeKind::Sticker {
+                            // Double-click a sticker: the next emoji.
+                            let st = crate::board::STICKERS;
+                            let i = st.iter().position(|e| *e == s.src).map_or(0, |i| i + 1);
+                            s.src = st[i % st.len()].to_string();
+                        } else {
+                            s.color = (s.color + 1) % crate::board::PALETTE_LEN;
+                        }
                     }
                     self.modified = true;
                 } else {
@@ -786,6 +908,27 @@ impl Editor {
                             id: s.id,
                             orig: (s.x1, s.y1, s.x2, s.y2),
                         },
+                        start: p,
+                        off: (wx, wy),
+                    };
+                }
+            }
+            Target::Connector(ci) => {
+                let Some(c) = board.connectors.get(ci) else {
+                    return true;
+                };
+                let (id, orig) = (c.id, (c.from.x, c.from.y, c.to.x, c.to.y));
+                let free = c.from.id == 0 || c.to.id == 0;
+                if double {
+                    // Double-click recolours.
+                    self.history.record(board, None);
+                    if let Some(c) = board.connector_mut(id) {
+                        c.color = (c.color + 1) % crate::board::PALETTE_LEN;
+                    }
+                    self.modified = true;
+                } else if free {
+                    self.drag = Drag::Pending {
+                        who: Mover::Connector { id, orig },
                         start: p,
                         off: (wx, wy),
                     };
@@ -812,6 +955,7 @@ impl Editor {
             }
             Target::FreeText(i) => Sel::Text(board.texts.get(i)?.id),
             Target::Shape(i) => Sel::Shape(board.shapes.get(i)?.id),
+            Target::Connector(i) => Sel::Connector(board.connectors.get(i)?.id),
         })
     }
 
@@ -831,6 +975,7 @@ impl Editor {
                 (s.x1, s.y1, s.x2, s.y2)
             }
             Sel::Text(_) => return None,
+            Sel::Connector(_) => (0.0, 0.0, 0.0, 0.0),
         })
     }
 
@@ -842,6 +987,7 @@ impl Editor {
             Some(Sel::Note(id)) => board.note(id).is_some(),
             Some(Sel::Shape(id)) => board.shape(id).is_some(),
             Some(Sel::Text(id)) => board.text(id).is_some(),
+            Some(Sel::Connector(id)) => board.connectors.iter().any(|c| c.id == id),
         };
         if !alive {
             self.selected = None;
@@ -904,7 +1050,9 @@ impl Editor {
             Sel::Note(id) => board.notes.retain(|n| n.id != id),
             Sel::Shape(id) => board.shapes.retain(|s| s.id != id),
             Sel::Text(id) => board.texts.retain(|t| t.id != id),
+            Sel::Connector(id) => board.connectors.retain(|c| c.id != id),
         }
+        board.prune_connectors();
         self.selected = None;
         self.modified = true;
         true
@@ -949,6 +1097,17 @@ impl Editor {
                     }
                     _ => {}
                 }
+            }
+            Sel::Connector(id) => {
+                let Some(c) = board.connector_mut(id) else {
+                    return false;
+                };
+                match handle {
+                    Handle::End1 => c.from = End::free(wx, wy),
+                    _ => c.to = End::free(wx, wy),
+                }
+                self.modified = true;
+                return true;
             }
             Sel::Shape(id) => {
                 let Some(s) = board.shape_mut(id) else {
@@ -1094,11 +1253,23 @@ impl Editor {
         }
     }
 
+    /// Pointer moved while drag-selecting text: the caret follows it. True if it moved.
+    pub fn drag_text(&mut self, board: &Board, cam: &Camera, p: (f32, f32), adv: Adv) -> bool {
+        let Drag::TextSelect { target } = self.drag else {
+            return false;
+        };
+        let w = cam.screen_to_world(p.0, p.1);
+        let caret = self.caret_for(board, target, w, adv);
+        let changed = self.editing.is_some_and(|e| e.caret != caret);
+        self.set_caret(caret);
+        changed
+    }
+
     /// Pointer moved. The camera is moved here when panning.
     pub fn motion(&mut self, board: &mut Board, cam: &mut Camera, p: (f32, f32)) -> bool {
         let (wx, wy) = cam.screen_to_world(p.0, p.1);
         match self.drag {
-            Drag::None => false,
+            Drag::None | Drag::TextSelect { .. } => false,
             Drag::Pan { last } => {
                 cam.pan_by_screen(p.0 - last.0, p.1 - last.1);
                 self.drag = Drag::Pan { last: p };
@@ -1114,6 +1285,14 @@ impl Editor {
                 self.apply_move(board, who, off, wx, wy)
             }
             Drag::Move { who, off } => self.apply_move(board, who, off, wx, wy),
+            Drag::Connect { id } => match board.connector_mut(id) {
+                Some(c) => {
+                    c.to = End::free(wx, wy);
+                    self.modified = true;
+                    true
+                }
+                None => false,
+            },
             Drag::DrawShape { id } => match board.shape_mut(id) {
                 Some(s) => {
                     (s.x2, s.y2) = (wx, wy);
@@ -1171,6 +1350,7 @@ impl Editor {
             Mover::Note(id) => Sel::Note(id),
             Mover::Text(id) => Sel::Text(id),
             Mover::Shape { id, .. } => Sel::Shape(id),
+            Mover::Connector { id, .. } => Sel::Connector(id),
         };
         let before = Self::origin_of(board, sel);
         let moved = self.apply_move_one(board, who, off, wx, wy);
@@ -1191,6 +1371,11 @@ impl Editor {
             Sel::Note(id) => board.note(id).map(|n| (n.x, n.y))?,
             Sel::Text(id) => board.text(id).map(|t| (t.x, t.y))?,
             Sel::Shape(id) => board.shape(id).map(|s| (s.x1, s.y1))?,
+            Sel::Connector(id) => board
+                .connectors
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.from.x, c.from.y))?,
         })
     }
 
@@ -1221,6 +1406,18 @@ impl Editor {
             Mover::Text(id) => {
                 if let Some(t) = board.text_mut(id) {
                     (t.x, t.y) = (x, y);
+                    self.modified = true;
+                    return true;
+                }
+            }
+            Mover::Connector { id, orig } => {
+                if let Some(c) = board.connector_mut(id) {
+                    if c.from.id == 0 {
+                        (c.from.x, c.from.y) = (orig.0 + x, orig.1 + y);
+                    }
+                    if c.to.id == 0 {
+                        (c.to.x, c.to.y) = (orig.2 + x, orig.3 + y);
+                    }
                     self.modified = true;
                     return true;
                 }
@@ -1263,6 +1460,7 @@ impl Editor {
     pub fn release(&mut self, board: &mut Board, adv: Adv) -> bool {
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         match drag {
+            Drag::TextSelect { .. } => false,
             Drag::Pending {
                 who: Mover::Note(id),
                 ..
@@ -1307,6 +1505,57 @@ impl Editor {
                     self.modified = true;
                 }
                 self.tool = Tool::Select;
+                true
+            }
+            Drag::Connect { id } => {
+                let end = board
+                    .connectors
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| (c.from, c.to));
+                if let Some((from, to)) = end {
+                    // Landing on an item attaches the end to it (but not back onto the start).
+                    let hit = item_at(board, to.x, to.y, adv).filter(|&i| i != from.id);
+                    let moved = (to.x - from.x).hypot(to.y - from.y);
+                    if hit.is_none() && from.id == 0 && moved < 8.0 {
+                        // A click on empty canvas: nothing to connect.
+                        board.connectors.retain(|c| c.id != id);
+                    } else if let Some(c) = board.connector_mut(id) {
+                        if let Some(h) = hit {
+                            c.to.id = h;
+                        } else if moved < 8.0 {
+                            // A click on an item: give the arrow a default length.
+                            c.to = End::free(from.x + 120.0, from.y);
+                        }
+                    }
+                }
+                self.modified = true;
+                self.tool = Tool::Select;
+                true
+            }
+            Drag::Resize {
+                sel: Sel::Connector(id),
+                handle,
+                ..
+            } => {
+                // Dropping an end on an item attaches it.
+                let other = board.connectors.iter().find(|c| c.id == id).map(|c| {
+                    if handle == Handle::End1 {
+                        (c.from, c.to.id)
+                    } else {
+                        (c.to, c.from.id)
+                    }
+                });
+                if let Some((end, other_id)) = other {
+                    let hit = item_at(board, end.x, end.y, adv).filter(|&i| i != other_id);
+                    if let (Some(h), Some(c)) = (hit, board.connector_mut(id)) {
+                        if handle == Handle::End1 {
+                            c.from.id = h;
+                        } else {
+                            c.to.id = h;
+                        }
+                    }
+                }
                 true
             }
             Drag::Resize { .. } => true,
@@ -1369,8 +1618,13 @@ impl Editor {
             Key::Tab => self.tab(board, edit.target, false),
             Key::BackTab => self.tab(board, edit.target, true),
             Key::Enter => self.enter(board, edit, adv),
-            Key::Up | Key::Down => self.vertical(board, edit, key == Key::Up, adv),
+            Key::Up | Key::Down => {
+                self.anchor = None;
+                self.vertical(board, edit, key == Key::Up, adv)
+            }
             Key::Text(_)
+            | Key::SelectAll
+            | Key::Cut
             | Key::Backspace
             | Key::Delete
             | Key::Left
@@ -1402,6 +1656,61 @@ impl Editor {
         let text = text_of(board, target).unwrap_or("").to_string();
         let mut chars: Vec<char> = text.chars().collect();
         let caret = edit.caret.min(chars.len());
+        let sel = self
+            .selection()
+            .map(|(s, e)| (s.min(chars.len()), e.min(chars.len())));
+        match key {
+            Key::SelectAll => {
+                self.anchor = Some(0);
+                self.set_caret(chars.len());
+                return;
+            }
+            Key::Cut | Key::Text(_) | Key::Backspace | Key::Delete if sel.is_some() => {
+                // Typing, Backspace, Delete and cut all first remove the selected text.
+                let (s, e) = sel.unwrap();
+                chars.drain(s..e);
+                let mut c = s;
+                if let Key::Text(t) = &key {
+                    for ch in t.chars() {
+                        if ch == '\n' && !target.multiline() {
+                            continue;
+                        }
+                        chars.insert(c, ch);
+                        c += 1;
+                    }
+                }
+                self.anchor = None;
+                self.commit_text(board, target, chars.iter().collect());
+                self.set_caret(c);
+                return;
+            }
+            Key::Cut => return,
+            _ => {}
+        }
+        // Plain cursor movement: Shift extends the selection, anything else drops it.
+        let moving = matches!(key, Key::Left | Key::Right | Key::Home | Key::End);
+        if moving {
+            if self.editor_shift() {
+                self.anchor.get_or_insert(caret);
+            } else if let Some((s, e)) = sel {
+                // Left / Right collapse to the matching edge of the selection.
+                match key {
+                    Key::Left => {
+                        self.anchor = None;
+                        self.set_caret(s);
+                        return;
+                    }
+                    Key::Right => {
+                        self.anchor = None;
+                        self.set_caret(e);
+                        return;
+                    }
+                    _ => self.anchor = None,
+                }
+            } else {
+                self.anchor = None;
+            }
+        }
         match key {
             Key::Text(s) => {
                 let mut c = caret;
@@ -1456,6 +1765,10 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    fn editor_shift(&self) -> bool {
+        self.shift
     }
 
     /// Backspace with the caret at the very start of a field.
@@ -2406,6 +2719,38 @@ mod tests {
     }
 
     #[test]
+    fn selection_copy_replace_and_cut() {
+        let (mut e, mut b) = setup();
+        let id = b.areas[2].id;
+        e.start_editing(EditTarget::TodoText(id, 0), 0);
+        e.shift = true;
+        e.key(&mut b, Key::Right, A);
+        e.key(&mut b, Key::Right, A);
+        e.shift = false;
+        assert_eq!(e.selection(), Some((0, 2)));
+        assert_eq!(e.selected_text(&b).as_deref(), Some("al"));
+        typed(&mut e, &mut b, "X"); // typing replaces the selection
+        assert_eq!(texts(&b)[0], "Xpha");
+        assert_eq!(e.selection(), None);
+        e.key(&mut b, Key::SelectAll, A);
+        assert_eq!(e.selected_text(&b).as_deref(), Some("Xpha"));
+        e.key(&mut b, Key::Cut, A);
+        assert_eq!(texts(&b)[0], "");
+        typed(&mut e, &mut b, "pasted"); // paste is a Key::Text
+        assert_eq!(texts(&b)[0], "pasted");
+    }
+
+    #[test]
+    fn plain_arrow_collapses_selection_to_its_edge() {
+        let (mut e, mut b) = setup();
+        let id = b.areas[2].id;
+        e.start_editing(EditTarget::TodoText(id, 0), 1);
+        e.key(&mut b, Key::SelectAll, A);
+        e.key(&mut b, Key::Left, A);
+        assert_eq!((e.editing.unwrap().caret, e.selection()), (0, None));
+    }
+
+    #[test]
     fn typing_is_one_undo_step_and_undo_leaves_edit_mode() {
         let (mut e, mut b) = setup();
         let id = b.areas[2].id;
@@ -2540,6 +2885,106 @@ mod tests {
         e.motion(b, &mut c, ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
         e.motion(b, &mut c, to);
         e.release(b, A);
+    }
+
+    #[test]
+    fn connector_attaches_to_items_follows_them_and_free_ends_work() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        draw_shape(&mut e, &mut b, Tool::Rect, (0.0, 0.0), (100.0, 100.0));
+        draw_shape(&mut e, &mut b, Tool::Rect, (400.0, 300.0), (500.0, 400.0));
+        let (r1, r2) = (b.shapes[0].id, b.shapes[1].id);
+        draw_shape(
+            &mut e,
+            &mut b,
+            Tool::Connector,
+            (50.0, 50.0),
+            (450.0, 350.0),
+        );
+        assert_eq!(b.connectors.len(), 1);
+        assert_eq!((b.connectors[0].from.id, b.connectors[0].to.id), (r1, r2));
+        assert_eq!(e.tool, Tool::Select);
+        // moving an attached item moves the arrow's end with it
+        let before = crate::layout::connector_path(&b, &b.connectors[0], A);
+        b.translate(Sel::Shape(r2), 0.0, 500.0);
+        let after = crate::layout::connector_path(&b, &b.connectors[0], A);
+        assert_ne!(before.last(), after.last());
+        assert!(after.last().unwrap().1 > 700.0, "{after:?}");
+        // a point-to-point arrow between empty spots keeps free ends
+        draw_shape(
+            &mut e,
+            &mut b,
+            Tool::Connector,
+            (1000.0, 1000.0),
+            (1200.0, 1100.0),
+        );
+        assert_eq!(b.connectors.len(), 2);
+        assert_eq!((b.connectors[1].from.id, b.connectors[1].to.id), (0, 0));
+        // a bare click on empty canvas makes nothing
+        draw_shape(
+            &mut e,
+            &mut b,
+            Tool::Connector,
+            (2000.0, 2000.0),
+            (2000.0, 2000.0),
+        );
+        assert_eq!(b.connectors.len(), 2);
+        // deleting an attached item frees that end instead of leaving a dangling id
+        e.selected = Some(Sel::Shape(r1));
+        assert!(e.delete_selected(&mut b));
+        assert_eq!(b.connectors[0].from.id, 0);
+        // undo brings the item and the attachment back
+        assert!(e.undo(&mut b));
+        assert_eq!(b.connectors[0].from.id, r1);
+    }
+
+    #[test]
+    fn connectors_can_be_selected_moved_reattached_recoloured_and_deleted() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        draw_shape(&mut e, &mut b, Tool::Rect, (0.0, 0.0), (100.0, 100.0));
+        draw_shape(&mut e, &mut b, Tool::Rect, (400.0, 0.0), (500.0, 100.0));
+        let (r1, r2) = (b.shapes[0].id, b.shapes[1].id);
+        // free arrow far away from the rects
+        draw_shape(
+            &mut e,
+            &mut b,
+            Tool::Connector,
+            (1000.0, 1000.0),
+            (1200.0, 1000.0),
+        );
+        let cid = b.connectors[0].id;
+        let mut c = cam();
+        // click on the line selects it
+        e.press(&mut b, &c, (1100.0, 1000.0), Button::Left, 0, A);
+        e.release(&mut b, A);
+        assert_eq!(e.selected, Some(Sel::Connector(cid)));
+        // drag the body: free ends move
+        e.press(&mut b, &c, (1100.0, 1000.0), Button::Left, 5000, A);
+        e.motion(&mut b, &mut c, (1100.0, 1050.0));
+        e.motion(&mut b, &mut c, (1100.0, 1100.0));
+        e.release(&mut b, A);
+        assert_eq!(
+            (b.connectors[0].from.y, b.connectors[0].to.y),
+            (1100.0, 1100.0)
+        );
+        // drag the end handle onto a rect: it attaches
+        e.press(&mut b, &c, (1200.0, 1100.0), Button::Left, 9000, A);
+        e.motion(&mut b, &mut c, (300.0, 50.0));
+        e.motion(&mut b, &mut c, (450.0, 50.0));
+        e.release(&mut b, A);
+        assert_eq!(b.connectors[0].to.id, r2);
+        // and the start end onto the other one
+        let start = crate::layout::connector_path(&b, &b.connectors[0], A)[0];
+        e.press(&mut b, &c, start, Button::Left, 14000, A);
+        e.motion(&mut b, &mut c, (30.0, 30.0));
+        e.motion(&mut b, &mut c, (50.0, 50.0));
+        e.release(&mut b, A);
+        assert_eq!((b.connectors[0].from.id, b.connectors[0].to.id), (r1, r2));
+        // delete key removes it, undo brings it back
+        e.selected = Some(Sel::Connector(cid));
+        assert!(e.delete_selected(&mut b));
+        assert!(b.connectors.is_empty());
+        assert!(e.undo(&mut b));
+        assert_eq!(b.connectors.len(), 1);
     }
 
     #[test]

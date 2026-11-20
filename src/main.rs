@@ -22,6 +22,7 @@ mod board;
 mod camera;
 mod editor;
 mod layout;
+mod pics;
 mod render;
 mod store;
 mod sync;
@@ -34,6 +35,12 @@ use layout::{area_geom, note_geom, Margins, Overlay, Rect, Tool, ViewBtn};
 use serde_json::json;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        data_source::{CopyPasteSource, DataSourceHandler},
+        DataDeviceManagerState, WritePipe,
+    },
     delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::{
@@ -64,7 +71,11 @@ use store::{Loaded, View};
 use text::{Fonts, Style};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
+        wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
+        wl_surface,
+    },
     Connection, QueueHandle,
 };
 
@@ -86,6 +97,16 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 const IDLE_SHRINK: Duration = Duration::from_secs(2);
 
 /// Resident set size in KiB, from /proc/self/status.
+/// Open a folder with the desktop's file manager, detached.
+fn open_in_file_manager(dir: &std::path::Path) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn vmrss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -96,6 +117,25 @@ fn vmrss_kib() -> u64 {
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(0)
+}
+
+/// Decode %XX escapes in a file:// URI path.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn rect_json(r: Rect) -> serde_json::Value {
@@ -171,6 +211,8 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell missing");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
+    // Without a data device manager the board still works, just without copy / paste.
+    let data_mgr = DataDeviceManagerState::bind(&globals, &qh).ok();
 
     let surface = compositor.create_surface(&qh);
     // The bottom layer sits above every background-layer surface, so a shell that (re)creates its
@@ -214,12 +256,30 @@ fn main() {
         }
     };
 
+    // Messages from helper threads (the folder picker) back into the event loop.
+    let (pick_tx, pick_rx) = smithay_client_toolkit::reexports::calloop::channel::channel::<String>();
+    event_loop
+        .handle()
+        .insert_source(pick_rx, |ev, _, app: &mut App| {
+            if let smithay_client_toolkit::reexports::calloop::channel::Event::Msg(dir) = ev {
+                app.set_wallpaper_folder(dir);
+            }
+        })
+        .expect("insert picker channel");
+
     let mut app = App {
+        pick_tx,
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
         pool,
+        conn: conn.clone(),
+        data_mgr,
+        data_device: None,
+        copy_source: None,
+        clip_text: String::new(),
+        key_serial: 0,
         layer,
         qh,
         loop_handle: event_loop.handle(),
@@ -259,6 +319,7 @@ fn main() {
         frame_pending: false,
         last_draw: Instant::now(),
         shrink_armed: false,
+        rotate_armed: false,
         configured: false,
         draws: 0,
         debug,
@@ -292,6 +353,14 @@ struct App {
     output_state: OutputState,
     shm: Shm,
     pool: SlotPool,
+    /// Clipboard: the manager, the per-seat device, our current copy source and its text.
+    conn: Connection,
+    data_mgr: Option<DataDeviceManagerState>,
+    data_device: Option<DataDevice>,
+    copy_source: Option<CopyPasteSource>,
+    clip_text: String,
+    /// Serial of the latest key press (the compositor wants it when we set the selection).
+    key_serial: u32,
     layer: LayerSurface,
     qh: QueueHandle<App>,
     loop_handle: LoopHandle<'static, App>,
@@ -334,6 +403,10 @@ struct App {
     last_draw: Instant,
     /// An idle-shrink timer is registered.
     shrink_armed: bool,
+    /// A wallpaper-rotation timer is registered.
+    rotate_armed: bool,
+    /// Folder chosen in the picker dialog arrives here.
+    pick_tx: smithay_client_toolkit::reexports::calloop::channel::Sender<String>,
     configured: bool,
     draws: u64,
     debug: bool,
@@ -548,7 +621,7 @@ impl App {
             "editing": editing,
             "camera": {"x": self.camera.x, "y": self.camera.y, "zoom": self.camera.zoom},
             "theme": format!("{:?}", self.theme),
-            "background": {"color": self.background.color, "image_on": self.background.image_on},
+            "background": {"color": self.background.color, "image_on": self.background.image_on, "image": self.background.image, "rotate_mins": self.background.rotate_mins, "random": self.background.random},
             "wallpaper_loaded": self.wallpaper.is_some(),
             "current_area": current,
             "tools": ov.tools.iter().map(|(t, r)| json!({"tool": format!("{t:?}"), "rect": rect_json(*r)})).collect::<Vec<_>>(),
@@ -593,6 +666,7 @@ impl App {
         self.frame_pending = false;
         self.draw();
         // The redraw above used the wallpaper cache; do not hold it while idle (rebuilt on demand).
+        self.fonts.pics.clear();
         self.wallpaper = None;
         self.log(format_args!("[shrink] VmRSS = {} KiB", vmrss_kib()));
     }
@@ -737,6 +811,13 @@ impl App {
     }
 
     fn set_tool(&mut self, tool: Tool) {
+        if tool == Tool::Image {
+            // A button, not a mode: paste the clipboard image now.
+            self.editor.set_tool(&mut self.board, Tool::Select);
+            self.paste_image();
+            self.after_edit();
+            return;
+        }
         self.editor.set_tool(&mut self.board, tool);
         self.after_edit();
     }
@@ -747,13 +828,273 @@ impl App {
         self.request_redraw();
     }
 
+    /// The wallpaper folder: the configured one, else `wallpapers/` in the data directory.
+    fn wallpaper_dir(&self) -> std::path::PathBuf {
+        match &self.background.folder {
+            Some(f) if !f.trim().is_empty() => std::path::PathBuf::from(f),
+            _ => store::data_dir().join("wallpapers"),
+        }
+    }
+
+    /// The `F` key: pick the wallpaper folder in a dialog (zenity); without zenity, open the
+    /// current folder in the file manager instead. Runs off-thread so the board stays live.
+    fn pick_wallpaper_folder(&self) {
+        let dir = self.wallpaper_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let tx = self.pick_tx.clone();
+        std::thread::spawn(move || {
+            let start = format!("{}/", dir.display());
+            let picked = std::process::Command::new("zenity")
+                .args(["--file-selection", "--directory", "--title=Wallpaper folder"])
+                .arg(format!("--filename={start}"))
+                .output();
+            match picked {
+                Ok(o) if o.status.success() => {
+                    let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !p.is_empty() {
+                        let _ = tx.send(p);
+                    }
+                }
+                Ok(_) => {} // dialog cancelled
+                Err(_) => open_in_file_manager(&dir),
+            }
+        });
+    }
+
+    /// The `Shift+F` key: open the wallpaper folder in the file manager.
+    fn open_wallpaper_folder(&self) {
+        let dir = self.wallpaper_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        open_in_file_manager(&dir);
+    }
+
+    /// A folder was chosen: use it and show its first wallpaper.
+    fn set_wallpaper_folder(&mut self, dir: String) {
+        self.background.folder = Some(dir);
+        self.background.image = None;
+        let images = self.wallpaper_list();
+        self.log(format_args!(
+            "[wallpaper] folder {:?}: {} images",
+            self.background.folder,
+            images.len()
+        ));
+        if let Some(first) = images.first() {
+            self.background.image_on = true;
+            self.background.color = None;
+            self.background.image = Some(first.clone());
+        } else {
+            eprintln!("wallboard: no PNG files in the chosen wallpaper folder");
+        }
+        self.wallpaper_changed();
+    }
+
+    /// Every wallpaper on offer, in cycle order: the configured image or `wallpaper.png` (when
+    /// it is not already in the folder), then the PNGs in `wallpapers/` sorted by name.
+    /// Scanned on demand; nothing is kept between calls.
+    fn wallpaper_list(&self) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(self.wallpaper_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("png"))
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        if let Some(extra) = self.wallpaper_path() {
+            if !found.contains(&extra) {
+                found.insert(0, extra);
+            }
+        }
+        found
+    }
+
     fn cycle_background(&mut self) {
-        let have = self.wallpaper_path().is_some();
-        self.background.cycle(have);
+        let images = self.wallpaper_list();
+        self.background.cycle(&images);
+        self.wallpaper_changed();
+    }
+
+    /// The `W` key: wallpaper rotation off -> in order -> random -> off.
+    fn cycle_rotation(&mut self) {
+        self.background.cycle_rotation();
+        if self.background.rotate_mins > 0 && !self.background.image_on {
+            // Turning rotation on should show a wallpaper straight away.
+            let images = self.wallpaper_list();
+            if let Some(first) = images.first() {
+                self.background.image_on = true;
+                self.background.color = None;
+                self.background.image.get_or_insert_with(|| first.clone());
+            }
+        }
+        self.log(format_args!(
+            "[rotate] every {} min, random={}",
+            self.background.rotate_mins, self.background.random
+        ));
+        self.wallpaper_changed();
+    }
+
+    /// The wallpaper choice changed: drop the cache, save, redraw, (re)arm rotation.
+    fn wallpaper_changed(&mut self) {
         self.wallpaper_failed = false;
         self.wallpaper = None;
+        self.arm_rotate();
         self.mark_dirty_for_save();
         self.request_redraw();
+    }
+
+    /// Register the rotation timer if rotation is on and it is not already running. The timer
+    /// fires once per interval, so it costs nothing in between.
+    fn arm_rotate(&mut self) {
+        if self.rotate_armed || self.background.rotate_mins == 0 || !self.background.image_on {
+            return;
+        }
+        self.rotate_armed = true;
+        let first = Duration::from_secs(self.background.rotate_mins as u64 * 60);
+        self.loop_handle
+            .insert_source(Timer::from_duration(first), |_, _, app: &mut App| {
+                if app.background.rotate_mins == 0 || !app.background.image_on {
+                    app.rotate_armed = false;
+                    return TimeoutAction::Drop;
+                }
+                let images = app.wallpaper_list();
+                let rnd = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                if app.background.advance(&images, rnd) {
+                    app.wallpaper_failed = false;
+                    app.wallpaper = None;
+                    app.mark_dirty_for_save();
+                    app.request_redraw();
+                }
+                TimeoutAction::ToDuration(Duration::from_secs(
+                    app.background.rotate_mins as u64 * 60,
+                ))
+            })
+            .expect("insert rotate timer");
+    }
+
+    // ---- clipboard
+
+    /// Copy the selected text to the clipboard (and remove it when `cut`).
+    fn copy_selection(&mut self, cut: bool) {
+        let Some(text) = self.editor.selected_text(&self.board) else {
+            return;
+        };
+        if let (Some(mgr), Some(dev)) = (&self.data_mgr, &self.data_device) {
+            let src = mgr.create_copy_paste_source(
+                &self.qh,
+                [
+                    "text/plain;charset=utf-8",
+                    "text/plain",
+                    "UTF8_STRING",
+                    "STRING",
+                ],
+            );
+            src.set_selection(dev, self.key_serial);
+            self.copy_source = Some(src);
+        }
+        self.clip_text = text;
+        if cut {
+            let f = &self.fonts;
+            let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
+            if self.editor.key(&mut self.board, Key::Cut, &adv) {
+                self.after_edit();
+            }
+        }
+    }
+
+    /// Read the clipboard owner's data in the first of `wanted` it offers: (mime, bytes).
+    fn read_offer(&self, wanted: &[&str]) -> Option<(String, Vec<u8>)> {
+        let offer = self.data_device.as_ref()?.data().selection_offer()?;
+        let mime = offer.with_mime_types(|m| {
+            wanted
+                .iter()
+                .find(|w| m.iter().any(|x| x == *w))
+                .map(|s| s.to_string())
+        })?;
+        let mut pipe = offer.receive(mime.clone()).ok()?;
+        // The request must reach the compositor before we wait for the owner's reply.
+        let _ = self.conn.flush();
+        // Read off-thread so a stuck clipboard owner cannot freeze the board.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let buf = rx.recv_timeout(Duration::from_millis(1500)).ok()?;
+        Some((mime, buf))
+    }
+
+    /// The clipboard's text: ours if we own the selection, otherwise read from the owner.
+    fn clipboard_text(&self) -> Option<String> {
+        if self.copy_source.is_some() {
+            return Some(self.clip_text.clone());
+        }
+        let (_, buf) = self.read_offer(&[
+            "text/plain;charset=utf-8",
+            "UTF8_STRING",
+            "text/plain",
+            "STRING",
+        ])?;
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Ctrl+V with nothing being edited: paste a copied image or an image file onto the board.
+    fn paste_image(&mut self) {
+        let png = if self.copy_source.is_some() {
+            None
+        } else {
+            self.read_offer(&["image/png"]).map(|(_, b)| b)
+        };
+        let bytes = png.or_else(|| {
+            // A copied file (file manager) or a typed-out path.
+            let (_, raw) = if self.copy_source.is_some() {
+                ("".to_string(), self.clip_text.clone().into_bytes())
+            } else {
+                self.read_offer(&["text/uri-list", "text/plain;charset=utf-8", "text/plain"])?
+            };
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let line = text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+            let path = line
+                .strip_prefix("file://")
+                .map_or(line.to_string(), percent_decode);
+            std::fs::read(path).ok()
+        });
+        let Some(bytes) = bytes else {
+            self.log(format_args!("[paste] no image on the clipboard"));
+            return;
+        };
+        match pics::import_png(&bytes) {
+            Ok((name, w, h)) => {
+                let c = self
+                    .camera
+                    .screen_to_world(self.width as f32 / 2.0, self.height as f32 / 2.0);
+                self.editor.add_image(&mut self.board, &name, (w, h), c);
+                self.after_edit();
+            }
+            Err(e) => eprintln!("wallboard: paste: {e} (only PNG images are supported)"),
+        }
+    }
+
+    fn paste(&mut self) {
+        let Some(text) = self.clipboard_text().filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let f = &self.fonts;
+        let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
+        if self.editor.key(&mut self.board, Key::Text(text), &adv) {
+            self.after_edit();
+        }
     }
 
     // ---- keyboard
@@ -775,6 +1116,7 @@ impl App {
             Keysym::End => Key::End,
             Keysym::Escape => Key::Escape,
             Keysym::p | Keysym::P if ctrl => Key::CyclePriority,
+            Keysym::a | Keysym::A if ctrl => Key::SelectAll,
             _ => {
                 if ctrl || self.mods.alt || self.mods.logo {
                     return None;
@@ -808,6 +1150,23 @@ impl App {
                     };
                     if changed {
                         self.after_edit();
+                    }
+                    return;
+                }
+                Keysym::c | Keysym::C | Keysym::x | Keysym::X if self.editor.editing.is_some() => {
+                    if !repeat {
+                        let cut = matches!(ev.keysym, Keysym::x | Keysym::X);
+                        self.copy_selection(cut);
+                    }
+                    return;
+                }
+                Keysym::v | Keysym::V => {
+                    if !repeat {
+                        if self.editor.editing.is_some() {
+                            self.paste();
+                        } else {
+                            self.paste_image();
+                        }
                     }
                     return;
                 }
@@ -859,6 +1218,9 @@ impl App {
             Keysym::c | Keysym::C => self.capture(),
             Keysym::l | Keysym::L => self.toggle_theme(),
             Keysym::b | Keysym::B => self.cycle_background(),
+            Keysym::w | Keysym::W => self.cycle_rotation(),
+            Keysym::f => self.pick_wallpaper_folder(),
+            Keysym::F => self.open_wallpaper_folder(),
             Keysym::question => self.show_help = !self.show_help,
             Keysym::Escape if self.show_help => self.show_help = false,
             Keysym::Escape => {
@@ -876,9 +1238,12 @@ impl App {
             Keysym::r | Keysym::R => self.set_tool(Tool::Rect),
             Keysym::o | Keysym::O => self.set_tool(Tool::Ellipse),
             Keysym::i | Keysym::I => self.set_tool(Tool::Line),
+            Keysym::a | Keysym::A => self.set_tool(Tool::Connector),
             Keysym::g | Keysym::G => self.set_tool(Tool::Group),
             Keysym::t | Keysym::T => self.set_tool(Tool::Todo),
             Keysym::n | Keysym::N => self.set_tool(Tool::Note),
+            Keysym::s | Keysym::S => self.set_tool(Tool::Sticker),
+            Keysym::m | Keysym::M => self.set_tool(Tool::Image),
             Keysym::p | Keysym::P => self.set_tool(Tool::Pen),
             Keysym::e | Keysym::E => self.set_tool(Tool::Eraser),
             _ => {}
@@ -1025,6 +1390,7 @@ impl LayerShellHandler for App {
         self.width = w;
         self.height = h;
         self.configured = true;
+        self.arm_rotate();
         if resized {
             self.wallpaper = None;
         }
@@ -1064,6 +1430,11 @@ impl SeatHandler for App {
                 )
                 .expect("keyboard");
             self.keyboard = Some(kb);
+        }
+        if capability == Capability::Keyboard && self.data_device.is_none() {
+            if let Some(m) = &self.data_mgr {
+                self.data_device = Some(m.get_data_device(qh, &seat));
+            }
         }
         if capability == Capability::Pointer && self.pointer.is_none() {
             self.pointer = Some(self.seat_state.get_pointer(qh, &seat).expect("pointer"));
@@ -1122,9 +1493,10 @@ impl KeyboardHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: u32,
+        serial: u32,
         ev: KeyEvent,
     ) {
+        self.key_serial = serial;
         self.handle_key(ev, false);
     }
     fn repeat_key(
@@ -1181,7 +1553,10 @@ impl PointerHandler for App {
                 PointerEventKind::Motion { .. } => {
                     self.cursor = pos;
                     if self.editor.is_dragging() {
-                        edited |= self.editor.motion(&mut self.board, &mut self.camera, pos);
+                        let f = &self.fonts;
+                        let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
+                        edited |= self.editor.drag_text(&self.board, &self.camera, pos, &adv)
+                            || self.editor.motion(&mut self.board, &mut self.camera, pos);
                     }
                 }
                 PointerEventKind::Press { button, time, .. } => {
@@ -1249,6 +1624,78 @@ impl ProvidesRegistryState for App {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
+}
+
+impl DataDeviceHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataDevice,
+        _: f64,
+        _: f64,
+        _: &wl_surface::WlSurface,
+    ) {
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataOfferHandler for App {
+    fn source_actions(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+    fn selected_action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl DataSourceHandler for App {
+    fn accept_mime(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataSource,
+        _: Option<String>,
+    ) {
+    }
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataSource,
+        _: String,
+        mut fd: WritePipe,
+    ) {
+        use std::io::Write;
+        let _ = fd.write_all(self.clip_text.as_bytes());
+    }
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        // Someone else copied: stop claiming the clipboard and paste from them instead.
+        if self
+            .copy_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            self.copy_source = None;
+        }
+        source.destroy();
+    }
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
 smithay_client_toolkit::delegate_dispatch2!(App);

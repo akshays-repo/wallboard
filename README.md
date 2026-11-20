@@ -75,8 +75,11 @@ has keyboard focus. Quit with `Ctrl+Q`.
 | `0` | fit everything on screen |
 | `+` / `-` | zoom |
 | `L` | dark / light |
-| `B` | cycle the background: theme colour, six colours, your wallpaper |
-| `V` `G` `T` `N` `P` `E` | tools: select, group, todo, note, pen, eraser (also the toolbar on the left) |
+| `B` | cycle the background: theme colour, six colours, then each wallpaper |
+| `F` / `Shift+F` | pick the wallpaper folder in a dialog (needs `zenity`; else it opens the folder) / open it in the file manager |
+| `W` | wallpaper rotation: off, in order, random (every 30 min, or `rotate_mins`) |
+| `S` `M` | sticker tool (click to drop an emoji; double-click it for the next one) and paste image (also `Ctrl+V` with nothing being edited: a copied PNG or image file); both are on the toolbar |
+| `V` `G` `T` `N` `A` `P` `E` | tools: select, group, todo, note, arrow, pen, eraser (also the toolbar on the left) |
 | `Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y` | undo, redo |
 | `Ctrl+Q` | quit |
 
@@ -100,7 +103,8 @@ it while wallboard is **not** running:
     { "label": "Terminal", "command": "alacritty" }
   ],
   "ui": { "top": 64, "bottom": 52 },   // keep the chips / dock clear of a shell bar and dock
-  "background": { "color": "#14211A", "image": "/home/me/wall.png", "image_on": false, "dim": 0.35 },
+  "background": { "color": "#14211A", "image": "/home/me/wall.png", "image_on": false, "dim": 0.35,
+                  "rotate_mins": 30, "random": true, "folder": "/home/me/Pictures/walls" },
   "backup": { "interval_secs": 600, "debounce_secs": 30 },   // git backup cadence (see below)
   "theme": "dark"
 }
@@ -111,6 +115,10 @@ it while wallboard is **not** running:
   (a JPEG gives a clear message and falls back to a colour; convert it with
   `magick wall.jpg wall.png`). It is darkened by `dim` so text stays readable, scaled to cover
   the screen, and its cache (about one screen buffer) is freed while idle.
+- **Many wallpapers + rotation:** drop PNGs into `wallpapers/` in the data folder. `B` steps
+  through them after the colours. `W` (or `"rotate_mins"` / `"random"` in `background`) changes
+  the wallpaper on a timer, in name order or at random. One timer wakeup per interval, and only
+  the current wallpaper is ever decoded.
 - **`ui` margins:** a shell bar or dock on niri's *top* layer sits above wallboard and swallows
   clicks under it. The defaults clear a typical 50 px bar and a dock; raise them if the chips or
   dock do not react to clicks.

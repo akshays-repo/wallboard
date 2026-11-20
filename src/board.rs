@@ -99,6 +99,10 @@ pub enum ShapeKind {
     Rect,
     Ellipse,
     Line,
+    /// A PNG kept in the data folder's `images/` (`Shape::src` is its file name).
+    Image,
+    /// An emoji sticker (`Shape::src` is the emoji).
+    Sticker,
 }
 
 /// A rectangle, ellipse or line between two world points.
@@ -115,7 +119,15 @@ pub struct Shape {
     /// Lock-together group id (0 = ungrouped). Moving one member moves them all.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub group: u64,
+    /// Image file name or sticker emoji (empty for plain shapes).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub src: String,
 }
+
+/// The stickers `S` cycles through.
+pub const STICKERS: [&str; 16] = [
+    "⭐", "❤", "🔥", "💡", "✅", "🚀", "🎯", "📌", "⚡", "🎉", "📅", "💬", "🏆", "🌱", "☕", "🎵",
+];
 
 impl Shape {
     /// Normalised bounding box (x, y, w, h).
@@ -123,6 +135,33 @@ impl Shape {
         let (x, y) = (self.x1.min(self.x2), self.y1.min(self.y2));
         (x, y, (self.x1 - self.x2).abs(), (self.y1 - self.y2).abs())
     }
+}
+
+/// One end of a connector: attached to an item (`id` != 0, follows it) or a free point.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct End {
+    /// Id of the card, note, text or shape it is attached to; 0 = free point.
+    #[serde(default)]
+    pub id: u64,
+    /// The free point (also the last known position while attached).
+    pub x: f32,
+    pub y: f32,
+}
+
+impl End {
+    pub fn free(x: f32, y: f32) -> Self {
+        End { id: 0, x, y }
+    }
+}
+
+/// An arrow from one point or item to another. Attached ends follow their item when it moves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Connector {
+    pub id: u64,
+    pub from: End,
+    pub to: End,
+    #[serde(default)]
+    pub color: u8,
 }
 
 /// Size given to a shape that was clicked rather than dragged.
@@ -265,7 +304,20 @@ pub struct Background {
     /// 0..1: how much the wallpaper is darkened so text stays readable.
     #[serde(default = "default_dim")]
     pub dim: f32,
+    /// Change the wallpaper every this many minutes (0 = never). Needs wallpapers in the
+    /// `wallpapers/` folder of the data directory.
+    #[serde(default)]
+    pub rotate_mins: u32,
+    /// Rotation picks a random wallpaper instead of the next one in name order.
+    #[serde(default)]
+    pub random: bool,
+    /// Folder holding the wallpapers (PNG). `None` uses `wallpapers/` in the data directory.
+    #[serde(default)]
+    pub folder: Option<String>,
 }
+
+/// Minutes between wallpaper changes when rotation is switched on with the `W` key.
+pub const DEFAULT_ROTATE_MINS: u32 = 30;
 
 fn default_dim() -> f32 {
     0.35
@@ -278,6 +330,9 @@ impl Default for Background {
             image: None,
             image_on: false,
             dim: default_dim(),
+            rotate_mins: 0,
+            random: false,
+            folder: None,
         }
     }
 }
@@ -305,12 +360,20 @@ impl Background {
         self.color.as_deref().and_then(parse_hex)
     }
 
-    /// Next background for the `B` key: theme default -> each preset -> wallpaper (if
-    /// `have_image`) -> theme default.
-    pub fn cycle(&mut self, have_image: bool) {
+    /// Next background for the `B` key: theme default -> each preset -> each wallpaper in
+    /// `images` (in order) -> theme default.
+    pub fn cycle(&mut self, images: &[String]) {
         if self.image_on {
-            self.image_on = false;
-            self.color = None;
+            let pos = self
+                .image
+                .as_ref()
+                .and_then(|p| images.iter().position(|i| i == p));
+            if let Some(i) = pos.filter(|i| i + 1 < images.len()) {
+                self.image = Some(images[i + 1].clone());
+            } else {
+                self.image_on = false;
+                self.color = None;
+            }
             return;
         }
         let idx = self.color.as_deref().and_then(|c| {
@@ -325,8 +388,46 @@ impl Background {
             }
             _ => {
                 self.color = None;
-                self.image_on = have_image;
+                if let Some(first) = images.first() {
+                    self.image_on = true;
+                    self.image = Some(first.clone());
+                }
             }
+        }
+    }
+
+    /// Rotation step: switch to the next wallpaper in `images`, or a random other one when
+    /// `random` is set (`rnd` is any random number). Returns false if there is nothing to
+    /// switch to.
+    pub fn advance(&mut self, images: &[String], rnd: u64) -> bool {
+        if images.len() < 2 {
+            return false;
+        }
+        let cur = self
+            .image
+            .as_ref()
+            .and_then(|p| images.iter().position(|i| i == p));
+        let next = match (self.random, cur) {
+            // A random pick that is never the current one.
+            (true, Some(c)) => (c + 1 + (rnd % (images.len() as u64 - 1)) as usize) % images.len(),
+            (true, None) => (rnd % images.len() as u64) as usize,
+            (false, Some(c)) => (c + 1) % images.len(),
+            (false, None) => 0,
+        };
+        self.image = Some(images[next].clone());
+        true
+    }
+
+    /// The `W` key: off -> in order -> random -> off.
+    pub fn cycle_rotation(&mut self) {
+        if self.rotate_mins == 0 {
+            self.rotate_mins = DEFAULT_ROTATE_MINS;
+            self.random = false;
+        } else if !self.random {
+            self.random = true;
+        } else {
+            self.rotate_mins = 0;
+            self.random = false;
         }
     }
 }
@@ -339,6 +440,7 @@ pub struct Board {
     pub strokes: Vec<Stroke>,
     pub texts: Vec<TextBox>,
     pub shapes: Vec<Shape>,
+    pub connectors: Vec<Connector>,
     next_id: u64,
 }
 
@@ -350,8 +452,66 @@ impl Board {
             strokes: Vec::new(),
             texts: Vec::new(),
             shapes: Vec::new(),
+            connectors: Vec::new(),
             next_id: 1,
         }
+    }
+
+    /// Attach loaded connectors, repairing bad values and ids.
+    pub fn with_connectors(mut self, mut cs: Vec<Connector>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        for c in &mut cs {
+            c.color %= PALETTE_LEN;
+            for e in [&mut c.from, &mut c.to] {
+                if !e.x.is_finite() || !e.y.is_finite() {
+                    (e.x, e.y) = (0.0, 0.0);
+                }
+            }
+            if c.id == 0 || !seen.insert(c.id) {
+                c.id = self.take_id();
+                seen.insert(c.id);
+            }
+            self.next_id = self.next_id.max(c.id.saturating_add(1));
+        }
+        self.connectors = cs;
+        self
+    }
+
+    /// True if `id` is a card, note, text or shape on the board.
+    pub fn has_item(&self, id: u64) -> bool {
+        self.areas.iter().any(|a| a.id == id)
+            || self.notes.iter().any(|n| n.id == id)
+            || self.texts.iter().any(|t| t.id == id)
+            || self.shapes.iter().any(|s| s.id == id)
+    }
+
+    /// Detach connector ends whose item was deleted (they stay as free points).
+    /// A connector with both ends on the same missing item is dropped.
+    pub fn prune_connectors(&mut self) {
+        let mut cs = std::mem::take(&mut self.connectors);
+        for c in &mut cs {
+            for e in [&mut c.from, &mut c.to] {
+                if e.id != 0 && !self.has_item(e.id) {
+                    e.id = 0;
+                }
+            }
+        }
+        self.connectors = cs;
+    }
+
+    pub fn add_connector(&mut self, from: End, to: End, color: u8) -> u64 {
+        let id = self.take_id();
+        self.connectors.push(Connector {
+            id,
+            from,
+            to,
+            color,
+        });
+        id
+    }
+
+    pub fn connector_mut(&mut self, id: u64) -> Option<&mut Connector> {
+        self.connectors.iter_mut().find(|c| c.id == id)
     }
 
     /// The life-OS layout: Inbox, Focus (hero), Work, Startups, Health, Learning, Life.
@@ -447,6 +607,14 @@ impl Board {
             }
         }
         for s in &mut shapes {
+            if s.kind == ShapeKind::Image
+                && !s
+                    .src
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+            {
+                s.src.clear(); // never let a saved file name point outside the images folder
+            }
             s.color %= PALETTE_LEN;
             for v in [&mut s.x1, &mut s.y1, &mut s.x2, &mut s.y2] {
                 if !v.is_finite() {
@@ -474,6 +642,7 @@ impl Board {
             strokes,
             texts,
             shapes,
+            connectors: Vec::new(),
             next_id: next,
         }
     }
@@ -491,6 +660,7 @@ impl Board {
             Sel::Note(id) => self.note(id).map_or(0, |n| n.group),
             Sel::Text(id) => self.text(id).map_or(0, |t| t.group),
             Sel::Shape(id) => self.shape(id).map_or(0, |s| s.group),
+            Sel::Connector(_) => 0,
         }
     }
 
@@ -501,6 +671,7 @@ impl Board {
             Sel::Note(id) => self.note_mut(id).map(|n| n.group = g),
             Sel::Text(id) => self.text_mut(id).map(|t| t.group = g),
             Sel::Shape(id) => self.shape_mut(id).map(|s| s.group = g),
+            Sel::Connector(_) => None,
         };
     }
 
@@ -595,6 +766,16 @@ impl Board {
                 if let Some(t) = self.text_mut(id) {
                     t.x += dx;
                     t.y += dy;
+                }
+            }
+            Sel::Connector(id) => {
+                if let Some(c) = self.connector_mut(id) {
+                    for e in [&mut c.from, &mut c.to] {
+                        if e.id == 0 {
+                            e.x += dx;
+                            e.y += dy;
+                        }
+                    }
                 }
             }
             Sel::Shape(id) => {
@@ -693,7 +874,27 @@ impl Board {
             y2: y,
             color: 0,
             group: 0,
+            src: String::new(),
         });
+        id
+    }
+
+    /// An image or sticker with its top-left corner at (x, y).
+    pub fn add_picture(
+        &mut self,
+        kind: ShapeKind,
+        src: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> u64 {
+        let id = self.add_shape(kind, x, y);
+        if let Some(s) = self.shape_mut(id) {
+            (s.x2, s.y2) = (x + w, y + h);
+            s.src = src.to_string();
+            s.color = (id % PALETTE_LEN as u64) as u8;
+        }
         id
     }
 
@@ -766,6 +967,7 @@ struct Snap {
     strokes: Vec<Stroke>,
     texts: Vec<TextBox>,
     shapes: Vec<Shape>,
+    connectors: Vec<Connector>,
 }
 
 impl Snap {
@@ -776,6 +978,7 @@ impl Snap {
             strokes: b.strokes.clone(),
             texts: b.texts.clone(),
             shapes: b.shapes.clone(),
+            connectors: b.connectors.clone(),
         }
     }
     /// Swap this snapshot with the board's current content.
@@ -785,6 +988,7 @@ impl Snap {
         std::mem::swap(&mut self.strokes, &mut b.strokes);
         std::mem::swap(&mut self.texts, &mut b.texts);
         std::mem::swap(&mut self.shapes, &mut b.shapes);
+        std::mem::swap(&mut self.connectors, &mut b.connectors);
     }
 }
 
@@ -1156,11 +1360,11 @@ mod tests {
         assert_eq!(b.solid(), None);
         let mut seen = Vec::new();
         for _ in 0..BACKGROUND_PRESETS.len() {
-            b.cycle(false);
+            b.cycle(&[]);
             seen.push(b.color.clone().unwrap());
         }
         assert_eq!(seen, BACKGROUND_PRESETS);
-        b.cycle(false);
+        b.cycle(&[]);
         assert_eq!(
             (b.color.clone(), b.image_on),
             (None, false),
@@ -1168,16 +1372,58 @@ mod tests {
         );
     }
 
+    fn two() -> Vec<String> {
+        vec!["/w/a.png".to_string(), "/w/b.png".to_string()]
+    }
+
     #[test]
-    fn background_cycle_with_image_ends_on_the_wallpaper() {
+    fn background_cycle_with_images_visits_each_wallpaper_then_default() {
+        let imgs = two();
         let mut b = Background::default();
         for _ in 0..BACKGROUND_PRESETS.len() {
-            b.cycle(true);
+            b.cycle(&imgs);
         }
-        b.cycle(true);
+        b.cycle(&imgs);
         assert!(b.image_on && b.color.is_none() && b.solid().is_none());
-        b.cycle(true);
-        assert!(!b.image_on && b.color.is_none(), "wallpaper -> default");
+        assert_eq!(b.image.as_deref(), Some("/w/a.png"));
+        b.cycle(&imgs);
+        assert_eq!(b.image.as_deref(), Some("/w/b.png"));
+        b.cycle(&imgs);
+        assert!(!b.image_on && b.color.is_none(), "last wallpaper -> default");
+    }
+
+    #[test]
+    fn advance_walks_in_order_and_random_never_repeats() {
+        let imgs = two();
+        let mut b = Background {
+            image_on: true,
+            image: Some(imgs[0].clone()),
+            ..Background::default()
+        };
+        assert!(b.advance(&imgs, 7));
+        assert_eq!(b.image.as_deref(), Some("/w/b.png"));
+        assert!(b.advance(&imgs, 7));
+        assert_eq!(b.image.as_deref(), Some("/w/a.png"), "wraps around");
+        b.random = true;
+        let three: Vec<String> = (0..3).map(|i| format!("/w/{i}.png")).collect();
+        b.image = Some(three[1].clone());
+        for rnd in 0..20 {
+            let before = b.image.clone();
+            assert!(b.advance(&three, rnd));
+            assert_ne!(b.image, before, "random pick differs from the current one");
+        }
+        assert!(!b.advance(&three[..1], 0), "one wallpaper: nothing to rotate to");
+    }
+
+    #[test]
+    fn rotation_key_goes_off_ordered_random_off() {
+        let mut b = Background::default();
+        b.cycle_rotation();
+        assert_eq!((b.rotate_mins, b.random), (DEFAULT_ROTATE_MINS, false));
+        b.cycle_rotation();
+        assert_eq!((b.rotate_mins, b.random), (DEFAULT_ROTATE_MINS, true));
+        b.cycle_rotation();
+        assert_eq!((b.rotate_mins, b.random), (0, false));
     }
 
     #[test]
@@ -1187,7 +1433,7 @@ mod tests {
             ..Background::default()
         };
         assert_eq!(b.solid(), None);
-        b.cycle(false);
+        b.cycle(&[]);
         assert_eq!(
             b.color, None,
             "an unknown colour resets to the default instead of looping"
@@ -1249,6 +1495,7 @@ mod tests {
             group: 0,
         };
         let sp = |id| Shape {
+            src: String::new(),
             id,
             kind: ShapeKind::Rect,
             x1: f32::INFINITY,

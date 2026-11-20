@@ -6,7 +6,7 @@
 //! - A file that cannot be used (corrupt, unknown version) is moved to `board.json.bad`
 //!   (or `.bad.1`, `.bad.2`, ... if one exists) and never overwritten; the app starts fresh.
 
-use crate::board::{Area, Background, Board, Note, Shape, Stroke, TextBox, Theme};
+use crate::board::{Area, Background, Board, Connector, Note, Shape, Stroke, TextBox, Theme};
 use crate::camera::Camera;
 use crate::layout::Margins;
 use crate::sync::BackupSettings;
@@ -43,6 +43,8 @@ struct FileData {
     #[serde(default)]
     shapes: Vec<Shape>,
     #[serde(default)]
+    connectors: Vec<Connector>,
+    #[serde(default)]
     next_id: u64,
     #[serde(default)]
     camera: Option<Camera>,
@@ -64,6 +66,7 @@ struct FileRef<'a> {
     strokes: &'a [Stroke],
     texts: &'a [TextBox],
     shapes: &'a [Shape],
+    connectors: &'a [Connector],
     next_id: u64,
     camera: Option<Camera>,
     theme: Theme,
@@ -131,7 +134,8 @@ pub fn load(path: &Path) -> Loaded {
                 );
             }
             Loaded::Ok {
-                board: Board::from_parts(f.areas, f.notes, f.strokes, f.texts, f.shapes, f.next_id),
+                board: Board::from_parts(f.areas, f.notes, f.strokes, f.texts, f.shapes, f.next_id)
+                    .with_connectors(f.connectors),
                 view: View {
                     camera: f.camera.filter(Camera::is_valid),
                     theme: f.theme,
@@ -181,6 +185,7 @@ pub fn save(path: &Path, board: &Board, view: &View) -> std::io::Result<()> {
         strokes: &board.strokes,
         texts: &board.texts,
         shapes: &board.shapes,
+        connectors: &board.connectors,
         next_id: board.next_id(),
         camera: view.camera,
         theme: view.theme,
@@ -208,6 +213,7 @@ pub fn content_hash(board: &Board) -> u64 {
         strokes: &'a [Stroke],
         texts: &'a [TextBox],
         shapes: &'a [Shape],
+        connectors: &'a [Connector],
     }
     let json = serde_json::to_string(&C {
         areas: &board.areas,
@@ -215,6 +221,7 @@ pub fn content_hash(board: &Board) -> u64 {
         strokes: &board.strokes,
         texts: &board.texts,
         shapes: &board.shapes,
+        connectors: &board.connectors,
     })
     .unwrap_or_default();
     let mut h = DefaultHasher::new();

@@ -61,6 +61,8 @@ pub struct Glyph {
 }
 
 pub struct Fonts {
+    /// Images and stickers (kept here so every draw already has it).
+    pub pics: crate::pics::Pics,
     regular: fontdue::Font,
     bold: fontdue::Font,
     adv: RefCell<HashMap<(Face, char), f32>>,
@@ -122,6 +124,7 @@ impl Fonts {
         let metrics = [m(&regular)?, m(&bold)?];
         Ok((
             Fonts {
+                pics: Default::default(),
                 regular,
                 bold,
                 adv: RefCell::new(HashMap::new()),

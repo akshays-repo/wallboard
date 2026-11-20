@@ -2,7 +2,7 @@
 //! screen-space toolbar, view menu and chips. Used by rendering, hit-testing and the editor so
 //! they always agree. Pure logic: text measuring comes in as a closure.
 
-use crate::board::{Area, Board, Note, Shape, ShapeKind, TextBox, Todo};
+use crate::board::{Area, Board, Connector, End, Note, Shape, ShapeKind, TextBox, Todo};
 use crate::camera::Camera;
 use crate::text::{wrap, Line, Style};
 use serde::{Deserialize, Serialize};
@@ -62,23 +62,31 @@ pub enum Tool {
     Todo,
     Note,
     Text,
+    /// Click to drop an emoji sticker.
+    Sticker,
+    /// Button: paste the clipboard image (never stays armed).
+    Image,
     Rect,
     Ellipse,
     Line,
+    Connector,
     Pen,
     Eraser,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 10] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Group,
         Tool::Todo,
         Tool::Note,
         Tool::Text,
+        Tool::Sticker,
+        Tool::Image,
         Tool::Rect,
         Tool::Ellipse,
         Tool::Line,
+        Tool::Connector,
         Tool::Pen,
         Tool::Eraser,
     ];
@@ -257,6 +265,7 @@ pub enum Sel {
     Note(u64),
     Shape(u64),
     Text(u64),
+    Connector(u64),
 }
 
 /// A resize handle on the selected item.
@@ -287,6 +296,16 @@ pub fn selection_rect(board: &Board, sel: Sel, adv: Adv) -> Option<Rect> {
             let (x, y, w, h) = board.shape(id)?.bbox();
             Rect::new(x, y, w, h)
         }
+        Sel::Connector(id) => {
+            let c = board.connectors.iter().find(|c| c.id == id)?;
+            let path = connector_path(board, c, adv);
+            let (mut x0, mut y0) = (f32::MAX, f32::MAX);
+            let (mut x1, mut y1) = (f32::MIN, f32::MIN);
+            for p in &path {
+                (x0, y0, x1, y1) = (x0.min(p.0), y0.min(p.1), x1.max(p.0), y1.max(p.1));
+            }
+            Rect::new(x0, y0, x1 - x0, y1 - y0)
+        }
     })
 }
 
@@ -298,6 +317,16 @@ pub fn handles(board: &Board, sel: Sel, adv: Adv) -> Vec<(Handle, (f32, f32))> {
                 return vec![(Handle::End1, (s.x1, s.y1)), (Handle::End2, (s.x2, s.y2))];
             }
         }
+    }
+    if let Sel::Connector(id) = sel {
+        let Some(c) = board.connectors.iter().find(|c| c.id == id) else {
+            return Vec::new();
+        };
+        let path = connector_path(board, c, adv);
+        return match (path.first(), path.last()) {
+            (Some(&a), Some(&b)) => vec![(Handle::End1, a), (Handle::End2, b)],
+            _ => Vec::new(),
+        };
     }
     if matches!(sel, Sel::Text(_)) {
         return Vec::new();
@@ -360,7 +389,9 @@ pub fn text_geom(t: &TextBox, adv: Adv) -> TextGeom {
 pub fn shape_hit(s: &Shape, wx: f32, wy: f32) -> bool {
     let (x, y, w, h) = s.bbox();
     match s.kind {
-        ShapeKind::Rect => Rect::new(x, y, w, h).contains(wx, wy),
+        ShapeKind::Rect | ShapeKind::Image | ShapeKind::Sticker => {
+            Rect::new(x, y, w, h).contains(wx, wy)
+        }
         ShapeKind::Ellipse => {
             let (rx, ry) = ((w / 2.0).max(1.0), (h / 2.0).max(1.0));
             let (dx, dy) = ((wx - (x + w / 2.0)) / rx, (wy - (y + h / 2.0)) / ry);
@@ -399,6 +430,8 @@ pub enum Target {
     FreeText(usize),
     /// A shape (index into `board.shapes`).
     Shape(usize),
+    /// A connector arrow (index into `board.connectors`).
+    Connector(usize),
 }
 
 pub fn hit_test(board: &Board, wx: f32, wy: f32, adv: Adv) -> Option<Target> {
@@ -459,7 +492,247 @@ pub fn hit_test(board: &Board, wx: f32, wy: f32, adv: Adv) -> Option<Target> {
             return Some(Target::Shape(si));
         }
     }
+    for (ci, c) in board.connectors.iter().enumerate().rev() {
+        if path_near(&connector_path(board, c, adv), wx, wy, 8.0) {
+            return Some(Target::Connector(ci));
+        }
+    }
     None
+}
+
+/// Rectangle of a card, note, text or shape by id.
+pub fn item_rect(board: &Board, id: u64, adv: Adv) -> Option<Rect> {
+    if let Some(a) = board.area(id) {
+        return Some(area_geom(a, adv).card);
+    }
+    if let Some(n) = board.note(id) {
+        return Some(note_geom(n, adv).card);
+    }
+    if let Some(t) = board.text(id) {
+        return Some(text_geom(t, adv).rect);
+    }
+    let (x, y, w, h) = board.shape(id)?.bbox();
+    Some(Rect::new(x, y, w, h))
+}
+
+/// The id of the item under a world point (cards, notes, texts, shapes), if any.
+pub fn item_at(board: &Board, wx: f32, wy: f32, adv: Adv) -> Option<u64> {
+    match hit_test(board, wx, wy, adv)? {
+        Target::NoteTitle(i) | Target::NoteBody(i) | Target::NoteDot(i) => {
+            board.notes.get(i).map(|n| n.id)
+        }
+        Target::FreeText(i) => board.texts.get(i).map(|t| t.id),
+        Target::Shape(i) => board.shapes.get(i).map(|s| s.id),
+        Target::Connector(_) => None,
+        Target::Title(a)
+        | Target::Dot(a)
+        | Target::NewTodo(a)
+        | Target::Body(a)
+        | Target::Circle(a, _)
+        | Target::Text(a, _)
+        | Target::Prio(a, _)
+        | Target::TodoBody(a, _) => board.areas.get(a).map(|a| a.id),
+    }
+}
+
+/// True if a world point is within `tol` of a polyline.
+pub fn path_near(path: &[(f32, f32)], wx: f32, wy: f32, tol: f32) -> bool {
+    path.windows(2).any(|w| {
+        let ((ax, ay), (bx, by)) = (w[0], w[1]);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 == 0.0 {
+            0.0
+        } else {
+            (((wx - ax) * dx + (wy - ay) * dy) / len2).clamp(0.0, 1.0)
+        };
+        (ax + t * dx - wx).hypot(ay + t * dy - wy) <= tol
+    })
+}
+
+/// Gap kept between an arrow's bend and the items, and the elbow corner radius.
+const CONN_STUB: f32 = 28.0;
+const CONN_RADIUS: f32 = 14.0;
+/// Items closer than this count as touching on that axis (no room for a side-to-side run).
+const CONN_GAP: f32 = 24.0;
+
+/// A connector's route as a smooth polyline in world units: an elbow path that leaves each
+/// attached item from the side facing the other end, with rounded corners. Recomputed from the
+/// items' current positions, so it follows them when they move or resize.
+pub fn connector_path(board: &Board, c: &Connector, adv: Adv) -> Vec<(f32, f32)> {
+    let rect_of = |e: &End| {
+        if e.id != 0 {
+            item_rect(board, e.id, adv)
+        } else {
+            None
+        }
+    };
+    round_corners(&route(
+        rect_of(&c.from),
+        (c.from.x, c.from.y),
+        rect_of(&c.to),
+        (c.to.x, c.to.y),
+    ))
+}
+
+fn center(r: Rect) -> (f32, f32) {
+    (r.x + r.w / 2.0, r.y + r.h / 2.0)
+}
+
+/// Sharp-cornered elbow route between two ends (an item rect, or a free point).
+pub fn route(
+    ra: Option<Rect>,
+    pa: (f32, f32),
+    rb: Option<Rect>,
+    pb: (f32, f32),
+) -> Vec<(f32, f32)> {
+    let ca = ra.map_or(pa, center);
+    let cb = rb.map_or(pb, center);
+    // Horizontal run if the ends are separated left/right, vertical if separated up/down;
+    // otherwise (overlapping) follow the dominant direction between the centres.
+    let (hsep, vsep) = match (ra, rb) {
+        (Some(a), Some(b)) => (
+            a.right() + CONN_GAP <= b.x || b.right() + CONN_GAP <= a.x,
+            a.bottom() + CONN_GAP <= b.y || b.bottom() + CONN_GAP <= a.y,
+        ),
+        _ => (true, true),
+    };
+    let (dx, dy) = (cb.0 - ca.0, cb.1 - ca.1);
+    let horizontal = match (hsep, vsep) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => dx.abs() >= dy.abs(),
+    };
+    let sgn = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+    // Anchor points on the facing sides; where the two items overlap on the cross axis, both
+    // anchors share the middle of the overlap so the arrow comes out straight.
+    let cross = |lo_a: f32, hi_a: f32, lo_b: f32, hi_b: f32, fallback: f32| {
+        let (lo, hi) = (lo_a.max(lo_b), hi_a.min(hi_b));
+        if hi - lo >= 8.0 {
+            (lo + hi) / 2.0
+        } else {
+            fallback
+        }
+    };
+    let (p0, d0, p1, d1);
+    if horizontal {
+        let s = sgn(dx);
+        let y_over = match (ra, rb) {
+            (Some(a), Some(b)) => Some(cross(a.y, a.bottom(), b.y, b.bottom(), f32::NAN)),
+            _ => None,
+        }
+        .filter(|y| y.is_finite());
+        let ya = y_over
+            .unwrap_or_else(|| ra.map_or(pa.1, |a| clampf(cb.1, a.y + 8.0, a.bottom() - 8.0)));
+        let yb = y_over
+            .unwrap_or_else(|| rb.map_or(pb.1, |b| clampf(ca.1, b.y + 8.0, b.bottom() - 8.0)));
+        let xa = ra.map_or(pa.0, |a| if s > 0.0 { a.right() } else { a.x });
+        let xb = rb.map_or(pb.0, |b| if s > 0.0 { b.x } else { b.right() });
+        (p0, d0, p1, d1) = ((xa, ya), (s, 0.0), (xb, yb), (-s, 0.0));
+    } else {
+        let s = sgn(dy);
+        let x_over = match (ra, rb) {
+            (Some(a), Some(b)) => Some(cross(a.x, a.right(), b.x, b.right(), f32::NAN)),
+            _ => None,
+        }
+        .filter(|x| x.is_finite());
+        let xa =
+            x_over.unwrap_or_else(|| ra.map_or(pa.0, |a| clampf(cb.0, a.x + 8.0, a.right() - 8.0)));
+        let xb =
+            x_over.unwrap_or_else(|| rb.map_or(pb.0, |b| clampf(ca.0, b.x + 8.0, b.right() - 8.0)));
+        let ya = ra.map_or(pa.1, |a| if s > 0.0 { a.bottom() } else { a.y });
+        let yb = rb.map_or(pb.1, |b| if s > 0.0 { b.y } else { b.bottom() });
+        (p0, d0, p1, d1) = ((xa, ya), (0.0, s), (xb, yb), (0.0, -s));
+    }
+    // Both ends travel along the same axis: a Z (or a C-shaped detour if they face backwards).
+    let forward = (p1.0 - p0.0) * d0.0 + (p1.1 - p0.1) * d0.1 > 1.0;
+    let mut pts = vec![p0];
+    if forward {
+        if horizontal {
+            let mx = (p0.0 + p1.0) / 2.0;
+            pts.extend([(mx, p0.1), (mx, p1.1)]);
+        } else {
+            let my = (p0.1 + p1.1) / 2.0;
+            pts.extend([(p0.0, my), (p1.0, my)]);
+        }
+    } else {
+        let (o0, o1) = (
+            (p0.0 + d0.0 * CONN_STUB, p0.1 + d0.1 * CONN_STUB),
+            (p1.0 + d1.0 * CONN_STUB, p1.1 + d1.1 * CONN_STUB),
+        );
+        if horizontal {
+            let my = (p0.1 + p1.1) / 2.0;
+            let my = if (p0.1 - p1.1).abs() < 1.0 {
+                p0.1 - CONN_STUB
+            } else {
+                my
+            };
+            pts.extend([(o0.0, p0.1), (o0.0, my), (o1.0, my), (o1.0, p1.1)]);
+        } else {
+            let mx = (p0.0 + p1.0) / 2.0;
+            let mx = if (p0.0 - p1.0).abs() < 1.0 {
+                p0.0 + CONN_STUB
+            } else {
+                mx
+            };
+            pts.extend([(p0.0, o0.1), (mx, o0.1), (mx, o1.1), (p1.0, o1.1)]);
+        }
+    }
+    pts.push(p1);
+    // Drop repeated points and merge collinear ones.
+    pts.dedup_by(|a, b| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01);
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    for p in pts {
+        while out.len() >= 2 {
+            let (a, b) = (out[out.len() - 2], out[out.len() - 1]);
+            let cross = (b.0 - a.0) * (p.1 - b.1) - (b.1 - a.1) * (p.0 - b.0);
+            if cross.abs() < 0.01 {
+                out.pop();
+            } else {
+                break;
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
+fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+    if lo > hi {
+        (lo + hi) / 2.0
+    } else {
+        v.clamp(lo, hi)
+    }
+}
+
+/// Replace each corner of a polyline with a small quadratic curve.
+pub fn round_corners(pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut out = vec![pts[0]];
+    for i in 1..pts.len() - 1 {
+        let (a, b, c) = (pts[i - 1], pts[i], pts[i + 1]);
+        let (la, lc) = ((b.0 - a.0).hypot(b.1 - a.1), (c.0 - b.0).hypot(c.1 - b.1));
+        let r = CONN_RADIUS.min(la / 2.0).min(lc / 2.0);
+        if r < 0.5 {
+            out.push(b);
+            continue;
+        }
+        let p = (b.0 + (a.0 - b.0) * r / la, b.1 + (a.1 - b.1) * r / la);
+        let q = (b.0 + (c.0 - b.0) * r / lc, b.1 + (c.1 - b.1) * r / lc);
+        const N: usize = 6;
+        for k in 0..=N {
+            let t = k as f32 / N as f32;
+            let u = 1.0 - t;
+            out.push((
+                u * u * p.0 + 2.0 * u * t * b.0 + t * t * q.0,
+                u * u * p.1 + 2.0 * u * t * b.1 + t * t * q.1,
+            ));
+        }
+    }
+    out.push(pts[pts.len() - 1]);
+    out
 }
 
 /// Bounding box of all cards and notes.
@@ -856,7 +1129,7 @@ mod tests {
     fn overlay_toolbar_and_chips() {
         let b = Board::default_board();
         let o = overlay(&b, 1920.0, 1080.0, Margins::default(), &tw);
-        assert_eq!(o.tools.len(), 10);
+        assert_eq!(o.tools.len(), 13);
         assert_eq!(o.tools[0].0, Tool::Select);
         assert!(o.tools_pill.x < 30.0, "toolbar hugs the left edge");
         let mid = o.tools_pill.y + o.tools_pill.h / 2.0;
@@ -977,6 +1250,7 @@ mod tests {
             y2,
             color: 0,
             group: 0,
+            src: String::new(),
         };
         let rect = mk(ShapeKind::Rect, 100.0, 50.0);
         assert!(shape_hit(&rect, 50.0, 25.0) && !shape_hit(&rect, 150.0, 25.0));
@@ -1095,5 +1369,28 @@ mod tests {
         assert_eq!((r.x, r.y, r.w, r.h), (100.0, 100.0, 800.0, 600.0));
         b.add_text(2000.0, -50.0);
         assert!(bounds(&b, A).unwrap().right() >= 2064.0);
+    }
+
+    #[test]
+    fn connector_routes_are_orthogonal_and_leave_the_facing_sides() {
+        let a = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let b = Rect::new(300.0, 200.0, 100.0, 100.0);
+        let p = route(Some(a), (0.0, 0.0), Some(b), (0.0, 0.0));
+        assert_eq!(p[0].0, 100.0, "leaves the right side of A: {p:?}");
+        assert_eq!(p[p.len() - 1].0, 300.0, "enters the left side of B: {p:?}");
+        assert!(p.windows(2).all(|w| w[0].0 == w[1].0 || w[0].1 == w[1].1));
+        // overlapping on the cross axis: one straight segment
+        let c = Rect::new(300.0, 20.0, 100.0, 60.0);
+        assert_eq!(route(Some(a), (0.0, 0.0), Some(c), (0.0, 0.0)).len(), 2);
+        // stacked: vertical run, bottom of A to top of B
+        let d = Rect::new(10.0, 300.0, 100.0, 50.0);
+        let p = route(Some(a), (0.0, 0.0), Some(d), (0.0, 0.0));
+        assert_eq!((p[0].1, p[p.len() - 1].1), (100.0, 300.0));
+        // free point to free point
+        let p = route(None, (0.0, 0.0), None, (200.0, 100.0));
+        assert_eq!((p[0], p[p.len() - 1]), ((0.0, 0.0), (200.0, 100.0)));
+        // rounded version still starts and ends on the endpoints
+        let r = round_corners(&p);
+        assert_eq!((r[0], r[r.len() - 1]), ((0.0, 0.0), (200.0, 100.0)));
     }
 }
