@@ -6,7 +6,7 @@
 //! - A file that cannot be used (corrupt, unknown version) is moved to `board.json.bad`
 //!   (or `.bad.1`, `.bad.2`, ... if one exists) and never overwritten; the app starts fresh.
 
-use crate::board::{default_launchers, Area, Background, Board, Launcher, Note, Stroke, Theme};
+use crate::board::{Area, Background, Board, Note, Shape, Stroke, TextBox, Theme};
 use crate::camera::Camera;
 use crate::layout::Margins;
 use crate::sync::BackupSettings;
@@ -38,8 +38,10 @@ struct FileData {
     notes: Vec<Note>,
     #[serde(default)]
     strokes: Vec<Stroke>,
-    #[serde(default = "default_launchers")]
-    launchers: Vec<Launcher>,
+    #[serde(default)]
+    texts: Vec<TextBox>,
+    #[serde(default)]
+    shapes: Vec<Shape>,
     #[serde(default)]
     next_id: u64,
     #[serde(default)]
@@ -60,7 +62,8 @@ struct FileRef<'a> {
     areas: &'a [Area],
     notes: &'a [Note],
     strokes: &'a [Stroke],
-    launchers: &'a [Launcher],
+    texts: &'a [TextBox],
+    shapes: &'a [Shape],
     next_id: u64,
     camera: Option<Camera>,
     theme: Theme,
@@ -128,7 +131,7 @@ pub fn load(path: &Path) -> Loaded {
                 );
             }
             Loaded::Ok {
-                board: Board::from_parts(f.areas, f.notes, f.strokes, f.launchers, f.next_id),
+                board: Board::from_parts(f.areas, f.notes, f.strokes, f.texts, f.shapes, f.next_id),
                 view: View {
                     camera: f.camera.filter(Camera::is_valid),
                     theme: f.theme,
@@ -176,7 +179,8 @@ pub fn save(path: &Path, board: &Board, view: &View) -> std::io::Result<()> {
         areas: &board.areas,
         notes: &board.notes,
         strokes: &board.strokes,
-        launchers: &board.launchers,
+        texts: &board.texts,
+        shapes: &board.shapes,
         next_id: board.next_id(),
         camera: view.camera,
         theme: view.theme,
@@ -202,13 +206,15 @@ pub fn content_hash(board: &Board) -> u64 {
         areas: &'a [Area],
         notes: &'a [Note],
         strokes: &'a [Stroke],
-        launchers: &'a [Launcher],
+        texts: &'a [TextBox],
+        shapes: &'a [Shape],
     }
     let json = serde_json::to_string(&C {
         areas: &board.areas,
         notes: &board.notes,
         strokes: &board.strokes,
-        launchers: &board.launchers,
+        texts: &board.texts,
+        shapes: &board.shapes,
     })
     .unwrap_or_default();
     let mut h = DefaultHasher::new();
@@ -255,10 +261,7 @@ mod tests {
                 color: Some("#14211A".into()),
                 ..Background::default()
             },
-            margins: Margins {
-                top: 70.0,
-                bottom: 40.0,
-            },
+            margins: Margins { top: 70.0 },
             backup: BackupSettings {
                 interval_secs: 120,
                 debounce_secs: 15,
@@ -277,7 +280,6 @@ mod tests {
                 assert_eq!(board.areas, b.areas);
                 assert_eq!(board.notes, b.notes);
                 assert_eq!(board.strokes, b.strokes);
-                assert_eq!(board.launchers, b.launchers);
                 assert_eq!(v, view());
                 assert!(board.next_id() >= b.next_id());
             }
@@ -289,27 +291,16 @@ mod tests {
     fn margins_round_trip_and_bad_values_are_repaired_on_load() {
         let d = tmpdir("margins");
         let p = d.join("board.json");
-        fs::write(
-            &p,
-            br#"{"version":2,"areas":[],"ui":{"top":-50,"bottom":99999}}"#,
-        )
-        .unwrap();
+        fs::write(&p, br#"{"version":2,"areas":[],"ui":{"top":-50}}"#).unwrap();
         match load(&p) {
             Loaded::Ok { view, .. } => {
                 assert_eq!(view.margins.top, 0.0);
-                assert_eq!(view.margins.bottom, 400.0);
             }
             other => panic!("{other:?}"),
         }
         fs::write(&p, br#"{"version":2,"areas":[],"ui":{"top":80}}"#).unwrap();
         match load(&p) {
-            Loaded::Ok { view, .. } => assert_eq!(
-                view.margins,
-                Margins {
-                    top: 80.0,
-                    bottom: 52.0
-                }
-            ),
+            Loaded::Ok { view, .. } => assert_eq!(view.margins, Margins { top: 80.0 }),
             other => panic!("{other:?}"),
         }
     }
@@ -469,21 +460,9 @@ mod tests {
                 assert_eq!(board.areas[0].todos[0].text, "keep");
                 assert!(!board.areas[0].hero && board.areas[0].todos[0].priority == 0);
                 assert!(board.notes.is_empty() && board.strokes.is_empty());
-                assert_eq!(board.launchers.len(), 3, "launchers default when absent");
                 assert_eq!(view, View::default());
                 assert!(board.next_id() > 3);
             }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_explicit_empty_launcher_list_is_respected() {
-        let d = tmpdir("nolaunch");
-        let p = d.join("board.json");
-        fs::write(&p, br#"{"version":2,"areas":[],"launchers":[]}"#).unwrap();
-        match load(&p) {
-            Loaded::Ok { board, .. } => assert!(board.launchers.is_empty()),
             other => panic!("{other:?}"),
         }
     }
@@ -517,22 +496,75 @@ mod tests {
     }
 
     #[test]
-    fn saved_launchers_are_editable_in_the_file() {
-        let d = tmpdir("launch");
+    fn files_from_before_the_dock_was_removed_still_load() {
+        // Older saves have a "launchers" list and "ui.bottom"; both are simply ignored now.
+        let d = tmpdir("olddock");
+        let p = d.join("board.json");
+        fs::write(
+            &p,
+            br#"{"version":2,"areas":[{"id":1,"name":"Inbox","x":0,"y":0}],
+                 "launchers":[{"label":"Files","command":"xdg-open ."}],"ui":{"top":70,"bottom":52}}"#,
+        )
+        .unwrap();
+        match load(&p) {
+            Loaded::Ok { board, view } => {
+                assert_eq!(board.areas[0].name, "Inbox");
+                assert_eq!(view.margins.top, 70.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn texts_shapes_and_resized_widths_survive_a_save_and_load() {
+        let d = tmpdir("freeitems");
         let p = d.join("board.json");
         let mut b = Board::default_board();
-        b.launchers = vec![Launcher {
-            label: "Notes".into(),
-            command: "gnome-text-editor".into(),
-        }];
+        b.areas[2].w = 480.0;
+        let n = b.add_note(5.0, 6.0);
+        b.note_mut(n).unwrap().w = 333.0;
+        let t = b.add_text(7.0, 8.0);
+        b.text_mut(t).unwrap().text = "free\ntext".into();
+        let sh = b.add_shape(crate::board::ShapeKind::Ellipse, 1.0, 2.0);
+        b.shape_mut(sh).unwrap().x2 = 90.0;
+        b.shape_mut(sh).unwrap().y2 = 70.0;
         save(&p, &b, &View::default()).unwrap();
-        let text = fs::read_to_string(&p).unwrap();
-        assert!(
-            text.contains("\"label\": \"Notes\"")
-                && text.contains("\"command\": \"gnome-text-editor\"")
-        );
         match load(&p) {
-            Loaded::Ok { board, .. } => assert_eq!(board.launchers, b.launchers),
+            Loaded::Ok { board, .. } => {
+                assert_eq!(board.areas[2].width(), 480.0);
+                assert_eq!(board.notes[0].width(), 333.0);
+                assert_eq!(board.texts, b.texts);
+                assert_eq!(board.shapes, b.shapes);
+                assert!(board.next_id() > sh);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_ne!(content_hash(&b), {
+            let mut c = Board::default_board();
+            c.areas[2].w = 480.0;
+            content_hash(&c)
+        });
+    }
+
+    #[test]
+    fn older_files_without_widths_texts_or_shapes_still_load() {
+        let d = tmpdir("nowidth");
+        let p = d.join("board.json");
+        fs::write(
+            &p,
+            br#"{"version":2,"areas":[{"id":1,"name":"Old","x":0,"y":0,"hero":true}],"notes":[{"id":2,"x":0,"y":0}]}"#,
+        )
+        .unwrap();
+        match load(&p) {
+            Loaded::Ok { board, .. } => {
+                assert_eq!(
+                    board.areas[0].width(),
+                    crate::board::HERO_W,
+                    "default hero width"
+                );
+                assert_eq!(board.notes[0].width(), crate::board::NOTE_W);
+                assert!(board.texts.is_empty() && board.shapes.is_empty());
+            }
             other => panic!("{other:?}"),
         }
     }

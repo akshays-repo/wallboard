@@ -30,6 +30,7 @@ pub enum Style {
     Chip,      // 13 regular
     ChipBold,  // 13 bold
     Hint,      // 11 regular
+    Free,      // 20 regular, free text on the canvas
 }
 
 impl Style {
@@ -46,6 +47,7 @@ impl Style {
             Style::Row => 15.0,
             Style::Chip | Style::ChipBold => 13.0,
             Style::Hint => 11.0,
+            Style::Free => 20.0,
         }
     }
 }

@@ -30,7 +30,7 @@ mod text;
 use board::{Background, Board, Theme};
 use camera::Camera;
 use editor::{Button, Editor, Key};
-use layout::{area_geom, note_geom, Margins, Overlay, Rect, Tool};
+use layout::{area_geom, note_geom, Margins, Overlay, Rect, Tool, ViewBtn};
 use serde_json::json;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -100,28 +100,6 @@ fn vmrss_kib() -> u64 {
 
 fn rect_json(r: Rect) -> serde_json::Value {
     json!([r.x, r.y, r.w, r.h])
-}
-
-/// Run a launcher command detached (its own process group, no stdio, reaped in a thread).
-fn launch(command: &str) {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    match Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-    {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(e) => eprintln!("wallboard: cannot run {command:?}: {e}"),
-    }
 }
 
 const HELP: &str = "wallboard: a life-OS home screen for niri
@@ -195,8 +173,14 @@ fn main() {
     let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
 
     let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Background, Some("wallboard"), None);
+    // The bottom layer sits above every background-layer surface, so a shell that (re)creates its
+    // own wallpaper a few seconds after login (DankMaterialShell does) cannot cover the board.
+    // WALLBOARD_LAYER=background opts back into the background layer.
+    let layer_kind = match std::env::var("WALLBOARD_LAYER").as_deref() {
+        Ok("background") => Layer::Background,
+        _ => Layer::Bottom,
+    };
+    let layer = layer_shell.create_layer_surface(&qh, surface, layer_kind, Some("wallboard"), None);
     layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
     layer.set_size(0, 0);
     layer.set_exclusive_zone(-1);
@@ -270,6 +254,7 @@ fn main() {
         save_armed: false,
         cursor: (0.0, 0.0),
         mods: Modifiers::default(),
+        show_help: false,
         dirty: false,
         frame_pending: false,
         last_draw: Instant::now(),
@@ -300,6 +285,8 @@ fn main() {
 }
 
 struct App {
+    /// The keyboard shortcuts popup is open.
+    show_help: bool,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
@@ -319,7 +306,7 @@ struct App {
     camera_loaded: bool,
     theme: Theme,
     background: Background,
-    /// Gaps kept clear above the chips and below the dock (see `layout::Margins`).
+    /// Gap kept clear above the chips (see `layout::Margins`).
     margins: Margins,
     /// Wallpaper pixels for the current buffer size (dropped when idle).
     wallpaper: Option<Vec<u8>>,
@@ -456,6 +443,7 @@ impl App {
             wallpaper: self.wallpaper.as_deref(),
             overlay: &overlay,
             current_area: current,
+            show_help: self.show_help,
         };
         render::draw(
             canvas,
@@ -520,6 +508,28 @@ impl App {
                 })
             })
             .collect();
+        let texts: Vec<_> = self
+            .board
+            .texts
+            .iter()
+            .map(|t| {
+                let g = layout::text_geom(t, &adv);
+                json!({"id": t.id, "text": t.text, "x": t.x, "y": t.y, "rect": rect_json(g.rect)})
+            })
+            .collect();
+        let shapes: Vec<_> = self
+            .board
+            .shapes
+            .iter()
+            .map(|s| json!({"id": s.id, "kind": format!("{:?}", s.kind), "x1": s.x1, "y1": s.y1, "x2": s.x2, "y2": s.y2, "color": s.color}))
+            .collect();
+        let selected = self.editor.selected.map(|sel| {
+            let hs: Vec<_> = layout::handles(&self.board, sel, &adv)
+                .into_iter()
+                .map(|(h, (x, y))| json!({"handle": format!("{h:?}"), "x": x, "y": y}))
+                .collect();
+            json!({"sel": format!("{sel:?}"), "handles": hs})
+        });
         let strokes: Vec<_> = self
             .board
             .strokes
@@ -533,7 +543,7 @@ impl App {
             .editing
             .map(|e| json!({"target": format!("{:?}", e.target), "caret": e.caret}));
         json!({
-            "areas": areas, "notes": notes, "strokes": strokes,
+            "areas": areas, "notes": notes, "strokes": strokes, "texts": texts, "shapes": shapes, "selected": selected,
             "tool": format!("{:?}", self.editor.tool),
             "editing": editing,
             "camera": {"x": self.camera.x, "y": self.camera.y, "zoom": self.camera.zoom},
@@ -542,8 +552,8 @@ impl App {
             "wallpaper_loaded": self.wallpaper.is_some(),
             "current_area": current,
             "tools": ov.tools.iter().map(|(t, r)| json!({"tool": format!("{t:?}"), "rect": rect_json(*r)})).collect::<Vec<_>>(),
+            "view_buttons": ov.view_btns.iter().map(|(b, r)| json!({"button": format!("{b:?}"), "rect": rect_json(*r)})).collect::<Vec<_>>(),
             "chips": ov.chips.iter().map(|(i, r)| json!({"area": i, "rect": rect_json(*r)})).collect::<Vec<_>>(),
-            "dock": ov.dock.iter().map(|(i, r)| json!({"launcher": i, "rect": rect_json(*r)})).collect::<Vec<_>>(),
             "view": [self.width, self.height],
             "glyphs": self.fonts.cached_glyphs(),
         })
@@ -801,6 +811,19 @@ impl App {
                     }
                     return;
                 }
+                Keysym::g | Keysym::G if self.editor.editing.is_none() => {
+                    if !repeat {
+                        let changed = if self.mods.shift {
+                            self.editor.ungroup_selected(&mut self.board)
+                        } else {
+                            self.editor.group_selected(&mut self.board)
+                        };
+                        if changed {
+                            self.after_edit();
+                        }
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -836,7 +859,23 @@ impl App {
             Keysym::c | Keysym::C => self.capture(),
             Keysym::l | Keysym::L => self.toggle_theme(),
             Keysym::b | Keysym::B => self.cycle_background(),
-            Keysym::v | Keysym::V | Keysym::Escape => self.set_tool(Tool::Select),
+            Keysym::question => self.show_help = !self.show_help,
+            Keysym::Escape if self.show_help => self.show_help = false,
+            Keysym::Escape => {
+                // Esc always goes back to plain selecting: drop the selection and any armed tool.
+                self.editor.deselect();
+                self.set_tool(Tool::Select);
+            }
+            Keysym::Delete | Keysym::BackSpace => {
+                if self.editor.delete_selected(&mut self.board) {
+                    self.after_edit();
+                }
+            }
+            Keysym::v | Keysym::V => self.set_tool(Tool::Select),
+            Keysym::x | Keysym::X => self.set_tool(Tool::Text),
+            Keysym::r | Keysym::R => self.set_tool(Tool::Rect),
+            Keysym::o | Keysym::O => self.set_tool(Tool::Ellipse),
+            Keysym::i | Keysym::I => self.set_tool(Tool::Line),
             Keysym::g | Keysym::G => self.set_tool(Tool::Group),
             Keysym::t | Keysym::T => self.set_tool(Tool::Todo),
             Keysym::n | Keysym::N => self.set_tool(Tool::Note),
@@ -850,21 +889,27 @@ impl App {
 
     /// A left click on the screen-space overlay. Returns true if it was handled there.
     fn overlay_click(&mut self, p: (f32, f32)) -> bool {
+        if self.show_help {
+            // Any click closes the popup and is swallowed.
+            self.show_help = false;
+            return true;
+        }
         let ov = self.overlay();
+        if let Some(btn) = ov.view_at(p.0, p.1) {
+            match btn {
+                ViewBtn::Help => self.show_help = true,
+                ViewBtn::ZoomIn => self.zoom_center(1.2),
+                ViewBtn::ZoomOut => self.zoom_center(1.0 / 1.2),
+                ViewBtn::Background => self.cycle_background(),
+            }
+            return true;
+        }
         if let Some(tool) = ov.tool_at(p.0, p.1) {
             self.set_tool(tool);
             return true;
         }
         if let Some(i) = ov.chip_at(p.0, p.1) {
             self.jump_to_area(i);
-            return true;
-        }
-        if let Some(i) = ov.dock_at(p.0, p.1) {
-            if let Some(l) = self.board.launchers.get(i) {
-                let command = l.command.clone();
-                self.log(format_args!("[launch] {command}"));
-                launch(&command);
-            }
             return true;
         }
         ov.covers(p.0, p.1) // clicks on a pill's padding go nowhere
@@ -1111,6 +1156,7 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.mods = m;
+        self.editor.shift = m.shift;
     }
 }
 

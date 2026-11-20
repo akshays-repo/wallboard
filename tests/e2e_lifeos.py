@@ -82,8 +82,8 @@ def main_session(data):
         check("Focus is the hero: wider than the others", focus["hero"] and focus["card"][2] > s.area("Work")["card"][2],
               f"{focus['card'][2]} vs {s.area('Work')['card'][2]}")
         check("first run opens on Focus", st["current_area"] == 1 and st["camera"]["zoom"] <= 1.2 + 1e-6, str((st["current_area"], st["camera"]["zoom"])))
-        check("toolbar (6 tools), chips (7) and dock (3) are present",
-              [t["tool"] for t in st["tools"]] == ["Select", "Group", "Todo", "Note", "Pen", "Eraser"] and len(st["chips"]) == 7 and len(st["dock"]) == 3)
+        check("toolbar (10 tools) and chips (7) are present, and the bottom bar is gone",
+              len(st["tools"]) == 10 and len(st["chips"]) == 7)
         check("starts in dark theme with the Select tool", st["theme"] == "Dark" and st["tool"] == "Select")
         s.shot("l1_start.png")
 
@@ -253,6 +253,120 @@ def main_session(data):
         check("V returns to Select", s.state()["tool"] == "Select")
         s.shot("l6_pen.png")
 
+        # ---------- free text, shapes, selection and resizing
+        tools_now = [x["tool"] for x in s.state()["tools"]]
+        check("toolbar now has Text, Rect, Ellipse and Line tools", tools_now == ["Select", "Group", "Todo", "Note", "Text", "Rect", "Ellipse", "Line", "Pen", "Eraser"], str(tools_now))
+        for key, name in (("x", "Text"), ("r", "Rect"), ("o", "Ellipse"), ("i", "Line")):
+            s.key(key)
+            check(f"key {key.upper()} arms the {name} tool", s.state()["tool"] == name)
+        s.key("v")
+
+        def tool_btn(name):
+            r = next(x for x in s.state()["tools"] if x["tool"] == name)["rect"]
+            return r[0] + r[2] / 2, r[1] + r[3] / 2
+
+        s.click(*tool_btn("Text"))
+        s.click(sw * 0.10, sh * 0.30)
+        st = s.state()
+        check("Text tool: click anywhere and type", len(st["texts"]) == 1 and st["editing"] and st["editing"]["target"].startswith("FreeText") and st["tool"] == "Select")
+        s.type("free words"); s.key("enter"); s.type("second line")
+        check("free text takes any typing, multi-line", s.state()["texts"][0]["text"] == "free words\nsecond line", repr(s.state()["texts"][0]["text"]))
+        s.key("esc")
+        ft = s.state()["texts"][0]
+        zoom = s.state()["camera"]["zoom"]
+        fx, fy = s.scr_at(ft["rect"], 0.3, 0.25)
+        s.drag(fx, fy, fx + 60, fy + 50)
+        ft2 = s.state()["texts"][0]
+        check("free text moves when dragged", near(ft2["x"] - ft["x"], 60 / zoom, 2) and near(ft2["y"] - ft["y"], 50 / zoom, 2), f"d=({ft2['x']-ft['x']:.1f},{ft2['y']-ft['y']:.1f})")
+        s.click(*s.scr_at(ft2["rect"], 0.3, 0.25))
+        check("clicking free text edits it again", s.state()["editing"] and s.state()["editing"]["target"].startswith("FreeText"))
+        s.key("esc")
+        s.shot("l5b_text.png")
+
+        s.click(*tool_btn("Rect"))
+        s.drag(sw * 0.12, sh * 0.50, sw * 0.24, sh * 0.62, steps=14)
+        st = s.state()
+        sh1 = st["shapes"][0]
+        check("Rectangle tool draws a rectangle by dragging", len(st["shapes"]) == 1 and sh1["kind"] == "Rect" and abs(sh1["x2"] - sh1["x1"]) > 20, str(sh1))
+        check("the new shape is selected and shows 4 resize handles", st["selected"] and len(st["selected"]["handles"]) == 4 and st["tool"] == "Select", str(st["selected"] and st["selected"]["sel"]))
+        # RESIZE by dragging a real corner handle
+        hb = next(h for h in st["selected"]["handles"] if h["handle"] == "BottomRight")
+        w_before = abs(sh1["x2"] - sh1["x1"]); h_before = abs(sh1["y2"] - sh1["y1"])
+        hx, hy = s.scr(hb["x"], hb["y"])
+        s.drag(hx, hy, hx + 90, hy + 60, steps=12)
+        sh1b = s.state()["shapes"][0]
+        z = s.state()["camera"]["zoom"]
+        check("dragging a corner handle resizes the rectangle", near(abs(sh1b["x2"] - sh1b["x1"]) - w_before, 90 / z, 3) and near(abs(sh1b["y2"] - sh1b["y1"]) - h_before, 60 / z, 3),
+              f"dw={abs(sh1b['x2']-sh1b['x1'])-w_before:.1f} dh={abs(sh1b['y2']-sh1b['y1'])-h_before:.1f} (expect {90/z:.1f},{60/z:.1f})")
+        s.ctrl("z")
+        sh1c = s.state()["shapes"][0]
+        check("a resize is one undo step", near(abs(sh1c["x2"] - sh1c["x1"]), w_before, 0.5))
+        s.ctrl("z", shift=True)
+
+        s.click(*tool_btn("Ellipse"))
+        s.drag(sw * 0.28, sh * 0.50, sw * 0.36, sh * 0.60, steps=12)
+        check("Ellipse tool draws an ellipse", len(s.state()["shapes"]) == 2 and s.state()["shapes"][1]["kind"] == "Ellipse")
+        s.click(*tool_btn("Line"))
+        s.drag(sw * 0.12, sh * 0.68, sw * 0.30, sh * 0.72, steps=12)
+        st = s.state()
+        check("Line tool draws a line with two end handles", len(st["shapes"]) == 3 and st["shapes"][2]["kind"] == "Line" and len(st["selected"]["handles"]) == 2)
+        e2 = next(h for h in st["selected"]["handles"] if h["handle"] == "End2")
+        ex, ey = s.scr(e2["x"], e2["y"])
+        old_end = (st["shapes"][2]["x2"], st["shapes"][2]["y2"])
+        s.drag(ex, ey, ex + 40, ey + 30, steps=8)
+        new_end = (s.state()["shapes"][2]["x2"], s.state()["shapes"][2]["y2"])
+        check("dragging a line's end handle moves just that end", near(new_end[0] - old_end[0], 40 / z, 3) and near(new_end[1] - old_end[1], 30 / z, 3) and near(s.state()["shapes"][2]["x1"], st["shapes"][2]["x1"], 0.01))
+        s.shot("l5c_shapes.png")
+        # move a shape by dragging its body, double-click recolours
+        s.key("esc")
+        ell = s.state()["shapes"][1]
+        mx, my = s.scr((ell["x1"] + ell["x2"]) / 2, (ell["y1"] + ell["y2"]) / 2)
+        s.drag(mx, my, mx + 50, my + 30, steps=8)
+        ell2 = s.state()["shapes"][1]
+        check("a shape moves when dragged by its body", near(ell2["x1"] - ell["x1"], 50 / z, 3) and near(ell2["y1"] - ell["y1"], 30 / z, 3))
+        # Delete removes the selection
+        n_shapes = len(s.state()["shapes"])
+        s.key("delete")
+        check("Delete removes the selected shape", len(s.state()["shapes"]) == n_shapes - 1 and s.state()["selected"] is None)
+        s.ctrl("z")
+        check("and that is undoable", len(s.state()["shapes"]) == n_shapes)
+        s.key("esc"); s.key("esc")
+
+        # resize a CARD (width) with its handles
+        work = s.area("Work")
+        wx0, wy0, ww0 = work["card"][0], work["card"][1], work["card"][2]
+        tx, ty = s.scr_c(work["title"])
+        s.click(tx, ty)
+        st = s.state()
+        check("clicking a card selects it and shows resize handles", st["selected"] and st["selected"]["sel"].startswith("Area") and len(st["selected"]["handles"]) == 4)
+        br = next(h for h in st["selected"]["handles"] if h["handle"] == "BottomRight")
+        hx, hy = s.scr(br["x"], br["y"])
+        s.drag(hx, hy, hx + 100, hy + 200, steps=12)
+        work2 = s.area("Work")
+        z = s.state()["camera"]["zoom"]
+        check("dragging a card's corner handle makes it wider", near(work2["card"][2] - ww0, 100 / z, 3), f"dw={work2['card'][2]-ww0:.1f} expected {100/z:.1f}")
+        check("the card keeps its left edge and its height follows the content", near(work2["card"][0], wx0, 0.01) and near(work2["card"][3], work["card"][3], 0.5))
+        s.ctrl("z")
+        check("card resize is undoable", near(s.area("Work")["card"][2], ww0, 0.5))
+        # resize a NOTE
+        nt = s.state()["notes"][0]
+        nw0 = nt["card"][2]
+        s.click(*s.scr_at(nt["card"], 0.5, 0.8))
+        st = s.state()
+        check("clicking a note selects it", st["selected"] and st["selected"]["sel"].startswith("Note"))
+        s.key("esc")  # stop editing the note body the click started
+        s.click(*s.scr_at(nt["card"], 0.5, 0.8)); s.key("esc")
+        st = s.state()
+        if st["selected"] and st["selected"]["sel"].startswith("Note"):
+            br = next(h for h in st["selected"]["handles"] if h["handle"] == "BottomRight")
+            hx, hy = s.scr(br["x"], br["y"])
+            s.drag(hx, hy, hx + 80, hy + 10, steps=10)
+            check("a note can be resized by its corner handle", s.state()["notes"][0]["card"][2] > nw0 + 40 / z, f"{nw0:.0f} -> {s.state()['notes'][0]['card'][2]:.0f}")
+        else:
+            check("a note can be resized by its corner handle", False, "note not selected")
+        s.key("esc")
+        s.key("v")
+
         # ---------- navigation
         s.key("0"); s.pump(0.2)
         c = s.state()["camera"]
@@ -285,6 +399,36 @@ def main_session(data):
         check("+ zooms in", s.state()["camera"]["zoom"] > z0 * 1.1)
         s.key("minus")
         check("- zooms out", near(s.state()["camera"]["zoom"], z0, 0.01), f"{s.state()['camera']['zoom']:.4f} vs {z0:.4f}")
+        zb = {b["button"]: b["rect"] for b in s.state()["view_buttons"]}
+        check("the right-hand menu has zoom in, zoom out and background buttons", set(zb) == {"ZoomIn", "ZoomOut", "Background"} and zb["ZoomIn"][0] > sw - 80, str(zb))
+        zc = s.state()["camera"]["zoom"]
+        s.click(zb["ZoomIn"][0] + zb["ZoomIn"][2] / 2, zb["ZoomIn"][1] + zb["ZoomIn"][3] / 2)
+        z_in = s.state()["camera"]["zoom"]
+        check("the zoom-in button zooms in", z_in > zc * 1.15, f"{zc:.3f} -> {z_in:.3f}")
+        check("clicking a zoom button does not touch the board", s.state()["editing"] is None)
+        s.click(zb["ZoomOut"][0] + zb["ZoomOut"][2] / 2, zb["ZoomOut"][1] + zb["ZoomOut"][3] / 2)
+        z_out = s.state()["camera"]["zoom"]
+        check("the zoom-out button zooms back out", near(z_out, zc, 0.01), f"{z_in:.3f} -> {z_out:.3f}")
+        for _ in range(14):
+            s.click(zb["ZoomIn"][0] + zb["ZoomIn"][2] / 2, zb["ZoomIn"][1] + zb["ZoomIn"][3] / 2)
+        check("zoom-in stops at the maximum instead of running away", s.state()["camera"]["zoom"] <= 8.0 + 1e-6, f"{s.state()['camera']['zoom']:.2f}")
+        for _ in range(30):
+            s.click(zb["ZoomOut"][0] + zb["ZoomOut"][2] / 2, zb["ZoomOut"][1] + zb["ZoomOut"][3] / 2)
+        check("zoom-out stops at the minimum", s.state()["camera"]["zoom"] >= 0.1 - 1e-6, f"{s.state()['camera']['zoom']:.3f}")
+        # background colour button in the same menu
+        bgb = zb["Background"]
+        before = s.state()["background"]["color"]
+        s.click(bgb[0] + bgb[2] / 2, bgb[1] + bgb[3] / 2)
+        after = s.state()["background"]["color"]
+        check("the background button cycles the colour (like B)", after != before, f"{before} -> {after}")
+        s.shot("l8b_bgbutton.png")
+        seen_bg = [after]
+        for _ in range(6):  # 7 clicks in total: back to the theme colour
+            s.click(bgb[0] + bgb[2] / 2, bgb[1] + bgb[3] / 2)
+            seen_bg.append(s.state()["background"]["color"])
+        check("repeated clicks walk through the presets and wrap back to the theme colour", None in seen_bg and len(set(seen_bg)) >= 6, str(seen_bg))
+        check("clicking it never starts editing", s.state()["editing"] is None)
+        s.key("0")
         cam = s.state()["camera"]
         # drag on empty canvas (free area) to pan
         s.drag(sw * 0.7, sh * 0.9, sw * 0.7 - 80, sh * 0.9 - 30, steps=10)
@@ -335,10 +479,10 @@ def main_session(data):
         # ---------- persistence on disk
         s.pump(1.5)
         j = read_json(data)
-        check("save file: version 2 with areas, notes, strokes, launchers, camera, theme, background",
+        check("save file: version 2 with areas, notes, strokes, camera, theme, background (and no launchers)",
               j["version"] == 2 and len(j["areas"]) == n_areas and len(j["notes"]) == 1 and len(j["strokes"]) == 1
-              and len(j["launchers"]) == 3 and "zoom" in j["camera"] and j["theme"] == "dark" and j["background"]["color"] == "#14211A",
-              str({k: (len(v) if isinstance(v, list) else v) for k, v in j.items() if k in ("areas", "notes", "strokes", "launchers")}))
+              and "launchers" not in j and "zoom" in j["camera"] and j["theme"] == "dark" and j["background"]["color"] == "#14211A",
+              str({k: (len(v) if isinstance(v, list) else v) for k, v in j.items() if k in ("areas", "notes", "strokes")}))
         files = sorted(os.listdir(data))
         check("no temp file left behind", not any(f.endswith(".tmp") for f in files), str(files))
         out["json"] = j
@@ -420,15 +564,13 @@ def bad_file_sessions():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def wallpaper_and_launcher_sessions():
+def wallpaper_sessions():
     d = tempfile.mkdtemp(prefix="wallboard-e2e-wp-")
-    marker = os.path.join(d, "launched.marker")
     png = os.path.join(d, "wp.png")
     make_png(png)
     board = {
         "version": 2,
         "areas": [{"id": 1, "name": "Inbox", "x": 0, "y": 0, "todos": [{"text": "hello"}]}],
-        "launchers": [{"label": "Touch", "command": f"touch {marker}"}],
         "background": {"image": png, "dim": 0.3},
     }
     with open(os.path.join(d, "board.json"), "w") as f:
@@ -438,12 +580,7 @@ def wallpaper_and_launcher_sessions():
         s.start()
         try:
             st = s.state()
-            check("custom launcher list from the file shows in the dock", len(st["dock"]) == 1)
-            r = st["dock"][0]["rect"]
-            check("nothing launched yet", not os.path.exists(marker))
-            s.click(r[0] + r[2] / 2, r[1] + r[3] / 2)
-            time.sleep(0.8)
-            check("clicking a dock button runs its command detached", os.path.exists(marker))
+            check("no bottom bar", "dock" not in st)
             seen = []
             for _ in range(7):
                 s.key("b")
@@ -506,7 +643,7 @@ def main():
         prev = main_session(data)
         restart_session(data, prev)
         bad_file_sessions()
-        wallpaper_and_launcher_sessions()
+        wallpaper_sessions()
         print(f"\nRSS idle in the main session: {prev['rss']} KiB")
     finally:
         shutil.rmtree(data, ignore_errors=True)

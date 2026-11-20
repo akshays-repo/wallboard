@@ -173,18 +173,23 @@ binds {
 
 layer-rule {
     match namespace="^wallboard$"
-    // In the overview, background layers zoom out with the workspaces. Uncomment to place the
-    // board in the overview *backdrop* instead (only for background surfaces without an
-    // exclusive zone, which wallboard is). Untested here: check how the overview looks.
+    // In the overview, background layers zoom out with the workspaces. place-within-backdrop only
+    // applies to the *background* layer, so it needs WALLBOARD_LAYER=background (see below).
+    // Untested here: check how the overview looks.
     // place-within-backdrop true
 }
 ```
 
 - **Restart cleanly:** `pkill wallboard; wallboard &` (or `systemctl --user restart wallboard`).
   It saves before exiting on Ctrl+Q; a plain `pkill` loses at most the last second.
-- **Another wallpaper tool** (swaybg, DankMaterialShell, ...) can stay running: wallboard
-  covers it while it runs and the wallpaper reappears when it exits. A shell **bar or dock**
-  on the top layer stays above the board; see the `ui` margins above.
+- **Layer:** wallboard runs on niri's **bottom** layer, which is above every background-layer
+  surface. That matters because a shell such as DankMaterialShell re-creates its own wallpaper
+  a few seconds after login and would otherwise cover a background-layer board. Set
+  `WALLBOARD_LAYER=background` to use the background layer instead (needed for
+  `place-within-backdrop`).
+- **Another wallpaper tool** (swaybg, DankMaterialShell, ...) can keep running: wallboard sits
+  above it while it runs and the wallpaper reappears when it exits. A shell **bar** on the top
+  layer stays above the board; see the `ui` margin above.
 - **Optional systemd user unit** instead of `spawn-at-startup`
   (`contrib/wallboard.service`):
 

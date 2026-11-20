@@ -1,4 +1,4 @@
-//! Board data model: areas (groups of todos), launchers, undo history. Pure Rust, no Wayland.
+//! Board data model: areas (groups of todos), notes, strokes, undo history. Pure Rust, no Wayland.
 //!
 //! Every field added after the first release has a serde default, so older save files load.
 
@@ -11,6 +11,10 @@ pub const PALETTE_LEN: u8 = 10;
 pub const MAX_HERO_OPEN: usize = 3;
 pub const MAX_PRIORITY: u8 = 3;
 pub const CARD_W: f32 = 320.0;
+/// Narrowest and widest a card or note can be resized to.
+pub const MIN_AREA_W: f32 = 240.0;
+pub const MIN_NOTE_W: f32 = 160.0;
+pub const MAX_W: f32 = 900.0;
 pub const HERO_W: f32 = 400.0;
 const GAP: f32 = 40.0;
 
@@ -50,9 +54,79 @@ pub struct Note {
     pub body: String,
     #[serde(default)]
     pub color: u8,
+    /// Note width. 0 (or too small) means `NOTE_W`. Height follows the text.
+    #[serde(default)]
+    pub w: f32,
+    /// Lock-together group id (0 = ungrouped). Moving one member moves them all.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub group: u64,
+}
+
+impl Note {
+    pub fn width(&self) -> f32 {
+        if self.w >= MIN_NOTE_W {
+            self.w.min(MAX_W)
+        } else {
+            NOTE_W
+        }
+    }
+}
+
+fn is_zero(g: &u64) -> bool {
+    *g == 0
 }
 
 pub const NOTE_W: f32 = 240.0;
+
+/// Free text on the canvas: no card, just text you can type anywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextBox {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub color: u8,
+    /// Lock-together group id (0 = ungrouped). Moving one member moves them all.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub group: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShapeKind {
+    Rect,
+    Ellipse,
+    Line,
+}
+
+/// A rectangle, ellipse or line between two world points.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Shape {
+    pub id: u64,
+    pub kind: ShapeKind,
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    #[serde(default)]
+    pub color: u8,
+    /// Lock-together group id (0 = ungrouped). Moving one member moves them all.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub group: u64,
+}
+
+impl Shape {
+    /// Normalised bounding box (x, y, w, h).
+    pub fn bbox(&self) -> (f32, f32, f32, f32) {
+        let (x, y) = (self.x1.min(self.x2), self.y1.min(self.y2));
+        (x, y, (self.x1 - self.x2).abs(), (self.y1 - self.y2).abs())
+    }
+}
+
+/// Size given to a shape that was clicked rather than dragged.
+pub const DEFAULT_SHAPE: (f32, f32) = (160.0, 100.0);
 
 /// A freehand pen stroke in world coordinates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,19 +153,34 @@ pub struct Area {
     pub color: u8,
     pub x: f32,
     pub y: f32,
+    /// Card width. 0 (or too small) means the default for its kind. Height follows the content.
+    #[serde(default)]
+    pub w: f32,
     /// The hero card: wider, accent border, limited to `MAX_HERO_OPEN` open todos.
     #[serde(default)]
     pub hero: bool,
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// Lock-together group id (0 = ungrouped). Moving one member moves them all.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub group: u64,
 }
 
 impl Area {
-    pub fn width(&self) -> f32 {
+    pub fn default_width(&self) -> f32 {
         if self.hero {
             HERO_W
         } else {
             CARD_W
+        }
+    }
+
+    /// The card's width: its own if it was resized, else the default.
+    pub fn width(&self) -> f32 {
+        if self.w >= MIN_AREA_W {
+            self.w.min(MAX_W)
+        } else {
+            self.default_width()
         }
     }
 
@@ -142,13 +231,6 @@ impl Area {
     pub fn cycle_color(&mut self) {
         self.color = (self.color + 1) % PALETTE_LEN;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Launcher {
-    pub label: String,
-    /// Run with `sh -c`, detached.
-    pub command: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -255,25 +337,9 @@ pub struct Board {
     pub areas: Vec<Area>,
     pub notes: Vec<Note>,
     pub strokes: Vec<Stroke>,
-    pub launchers: Vec<Launcher>,
+    pub texts: Vec<TextBox>,
+    pub shapes: Vec<Shape>,
     next_id: u64,
-}
-
-pub fn default_launchers() -> Vec<Launcher> {
-    vec![
-        Launcher {
-            label: "Files".into(),
-            command: "xdg-open \"$HOME\"".into(),
-        },
-        Launcher {
-            label: "Browser".into(),
-            command: "xdg-open about:blank".into(),
-        },
-        Launcher {
-            label: "Terminal".into(),
-            command: "alacritty".into(),
-        },
-    ]
 }
 
 impl Board {
@@ -282,7 +348,8 @@ impl Board {
             areas: Vec::new(),
             notes: Vec::new(),
             strokes: Vec::new(),
-            launchers: default_launchers(),
+            texts: Vec::new(),
+            shapes: Vec::new(),
             next_id: 1,
         }
     }
@@ -319,7 +386,8 @@ impl Board {
         mut areas: Vec<Area>,
         mut notes: Vec<Note>,
         mut strokes: Vec<Stroke>,
-        launchers: Vec<Launcher>,
+        mut texts: Vec<TextBox>,
+        mut shapes: Vec<Shape>,
         next_id: u64,
     ) -> Self {
         let mut next = next_id.max(1);
@@ -328,6 +396,8 @@ impl Board {
             .map(|a| a.id)
             .chain(notes.iter().map(|n| n.id))
             .chain(strokes.iter().map(|s| s.id))
+            .chain(texts.iter().map(|t| t.id))
+            .chain(shapes.iter().map(|s| s.id))
         {
             next = next.max(id.saturating_add(1));
         }
@@ -370,17 +440,172 @@ impl Board {
                 t.priority = t.priority.min(MAX_PRIORITY);
             }
         }
+        for t in &mut texts {
+            t.color %= PALETTE_LEN;
+            if !t.x.is_finite() || !t.y.is_finite() {
+                (t.x, t.y) = (0.0, 0.0);
+            }
+        }
+        for s in &mut shapes {
+            s.color %= PALETTE_LEN;
+            for v in [&mut s.x1, &mut s.y1, &mut s.x2, &mut s.y2] {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+            }
+        }
+        let mut seen_t = std::collections::HashSet::new();
+        for t in &mut texts {
+            if !seen_t.insert(t.id) {
+                t.id = next;
+                next += 1;
+            }
+        }
+        let mut seen_h = std::collections::HashSet::new();
+        for s in &mut shapes {
+            if !seen_h.insert(s.id) {
+                s.id = next;
+                next += 1;
+            }
+        }
         Board {
             areas,
             notes,
             strokes,
-            launchers,
+            texts,
+            shapes,
             next_id: next,
         }
     }
 
     pub fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    // ---- lock-together groups
+
+    pub fn group_of(&self, sel: crate::layout::Sel) -> u64 {
+        use crate::layout::Sel;
+        match sel {
+            Sel::Area(id) => self.area(id).map_or(0, |a| a.group),
+            Sel::Note(id) => self.note(id).map_or(0, |n| n.group),
+            Sel::Text(id) => self.text(id).map_or(0, |t| t.group),
+            Sel::Shape(id) => self.shape(id).map_or(0, |s| s.group),
+        }
+    }
+
+    fn set_group_of(&mut self, sel: crate::layout::Sel, g: u64) {
+        use crate::layout::Sel;
+        match sel {
+            Sel::Area(id) => self.area_mut(id).map(|a| a.group = g),
+            Sel::Note(id) => self.note_mut(id).map(|n| n.group = g),
+            Sel::Text(id) => self.text_mut(id).map(|t| t.group = g),
+            Sel::Shape(id) => self.shape_mut(id).map(|s| s.group = g),
+        };
+    }
+
+    /// Every item in group `g` (empty for 0).
+    pub fn group_members(&self, g: u64) -> Vec<crate::layout::Sel> {
+        use crate::layout::Sel;
+        if g == 0 {
+            return Vec::new();
+        }
+        let mut v = Vec::new();
+        v.extend(
+            self.areas
+                .iter()
+                .filter(|a| a.group == g)
+                .map(|a| Sel::Area(a.id)),
+        );
+        v.extend(
+            self.notes
+                .iter()
+                .filter(|n| n.group == g)
+                .map(|n| Sel::Note(n.id)),
+        );
+        v.extend(
+            self.texts
+                .iter()
+                .filter(|t| t.group == g)
+                .map(|t| Sel::Text(t.id)),
+        );
+        v.extend(
+            self.shapes
+                .iter()
+                .filter(|s| s.group == g)
+                .map(|s| Sel::Shape(s.id)),
+        );
+        v
+    }
+
+    /// Lock the given items (and anything already grouped with them) into one group.
+    /// Needs at least two items; returns the new group id.
+    pub fn group_items(&mut self, items: &[crate::layout::Sel]) -> Option<u64> {
+        let mut all = Vec::new();
+        for &s in items {
+            let g = self.group_of(s);
+            let part = if g == 0 {
+                vec![s]
+            } else {
+                self.group_members(g)
+            };
+            for m in part {
+                if !all.contains(&m) {
+                    all.push(m);
+                }
+            }
+        }
+        if all.len() < 2 {
+            return None;
+        }
+        let g = self.take_id();
+        for m in all {
+            self.set_group_of(m, g);
+        }
+        Some(g)
+    }
+
+    /// Release every member of the group `sel` belongs to. True if it was grouped.
+    pub fn ungroup(&mut self, sel: crate::layout::Sel) -> bool {
+        let g = self.group_of(sel);
+        let members = self.group_members(g);
+        for m in &members {
+            self.set_group_of(*m, 0);
+        }
+        !members.is_empty()
+    }
+
+    /// Shift one item by (dx, dy) world units.
+    pub fn translate(&mut self, sel: crate::layout::Sel, dx: f32, dy: f32) {
+        use crate::layout::Sel;
+        match sel {
+            Sel::Area(id) => {
+                if let Some(a) = self.area_mut(id) {
+                    a.x += dx;
+                    a.y += dy;
+                }
+            }
+            Sel::Note(id) => {
+                if let Some(n) = self.note_mut(id) {
+                    n.x += dx;
+                    n.y += dy;
+                }
+            }
+            Sel::Text(id) => {
+                if let Some(t) = self.text_mut(id) {
+                    t.x += dx;
+                    t.y += dy;
+                }
+            }
+            Sel::Shape(id) => {
+                if let Some(s) = self.shape_mut(id) {
+                    s.x1 += dx;
+                    s.x2 += dx;
+                    s.y1 += dy;
+                    s.y2 += dy;
+                }
+            }
+        }
     }
 
     pub fn add_area(&mut self, x: f32, y: f32) -> u64 {
@@ -392,8 +617,10 @@ impl Board {
             color,
             x,
             y,
+            w: 0.0,
             hero: false,
             todos: Vec::new(),
+            group: 0,
         });
         id
     }
@@ -414,6 +641,8 @@ impl Board {
             title: String::new(),
             body: String::new(),
             color,
+            w: 0.0,
+            group: 0,
         });
         id
     }
@@ -430,6 +659,50 @@ impl Board {
         let before = self.notes.len();
         self.notes.retain(|n| n.id != id);
         self.notes.len() != before
+    }
+
+    pub fn add_text(&mut self, x: f32, y: f32) -> u64 {
+        let id = self.take_id();
+        self.texts.push(TextBox {
+            id,
+            x,
+            y,
+            text: String::new(),
+            color: 0,
+            group: 0,
+        });
+        id
+    }
+
+    pub fn text(&self, id: u64) -> Option<&TextBox> {
+        self.texts.iter().find(|t| t.id == id)
+    }
+
+    pub fn text_mut(&mut self, id: u64) -> Option<&mut TextBox> {
+        self.texts.iter_mut().find(|t| t.id == id)
+    }
+
+    pub fn add_shape(&mut self, kind: ShapeKind, x: f32, y: f32) -> u64 {
+        let id = self.take_id();
+        self.shapes.push(Shape {
+            id,
+            kind,
+            x1: x,
+            y1: y,
+            x2: x,
+            y2: y,
+            color: 0,
+            group: 0,
+        });
+        id
+    }
+
+    pub fn shape(&self, id: u64) -> Option<&Shape> {
+        self.shapes.iter().find(|s| s.id == id)
+    }
+
+    pub fn shape_mut(&mut self, id: u64) -> Option<&mut Shape> {
+        self.shapes.iter_mut().find(|s| s.id == id)
     }
 
     pub fn add_stroke(&mut self, x: f32, y: f32, color: u8) -> u64 {
@@ -479,7 +752,7 @@ impl Board {
     }
 }
 
-/// Undo/redo by snapshot of areas, notes and strokes (launchers are edited in the file).
+/// Undo/redo by snapshot of areas, notes, strokes, texts and shapes .
 /// Boards are small, so this is simpler and sturdier than inverse commands; the stack is
 /// capped to bound memory. Consecutive edits with the same group key within `GROUP_WINDOW`
 /// (typing in one field) share a single step.
@@ -491,6 +764,8 @@ struct Snap {
     areas: Vec<Area>,
     notes: Vec<Note>,
     strokes: Vec<Stroke>,
+    texts: Vec<TextBox>,
+    shapes: Vec<Shape>,
 }
 
 impl Snap {
@@ -499,6 +774,8 @@ impl Snap {
             areas: b.areas.clone(),
             notes: b.notes.clone(),
             strokes: b.strokes.clone(),
+            texts: b.texts.clone(),
+            shapes: b.shapes.clone(),
         }
     }
     /// Swap this snapshot with the board's current content.
@@ -506,6 +783,8 @@ impl Snap {
         std::mem::swap(&mut self.areas, &mut b.areas);
         std::mem::swap(&mut self.notes, &mut b.notes);
         std::mem::swap(&mut self.strokes, &mut b.strokes);
+        std::mem::swap(&mut self.texts, &mut b.texts);
+        std::mem::swap(&mut self.shapes, &mut b.shapes);
     }
 }
 
@@ -599,8 +878,6 @@ mod tests {
         }
         let ids: std::collections::HashSet<u64> = b.areas.iter().map(|a| a.id).collect();
         assert_eq!(ids.len(), 7);
-        assert_eq!(b.launchers.len(), 3);
-        assert_eq!(b.launchers[0].label, "Files");
         assert_eq!(b.inbox_index(), Some(0));
     }
 
@@ -707,6 +984,7 @@ mod tests {
             color,
             x: 0.0,
             y: 0.0,
+            w: 0.0,
             hero: false,
             todos: vec![Todo {
                 text: "t".into(),
@@ -714,9 +992,11 @@ mod tests {
                 priority: prio,
                 body: None,
             }],
+            group: 0,
         };
         let b = Board::from_parts(
             vec![mk(7, 99, 9), mk(7, 1, 1), mk(3, 2, 2)],
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -851,6 +1131,7 @@ mod tests {
                 st(2, vec![(f32::NAN, 0.0), (1.0, 1.0)], 999.0),
             ],
             vec![],
+            vec![],
             1,
         );
         assert_eq!(b.strokes.len(), 2, "empty stroke dropped");
@@ -918,5 +1199,101 @@ mod tests {
         let b: Background = serde_json::from_str("{}").unwrap();
         assert_eq!(b, Background::default());
         assert!((b.dim - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn texts_and_shapes_have_unique_ids_defaults_and_roundtrip() {
+        let mut b = Board::new();
+        let t = b.add_text(5.0, 6.0);
+        let s = b.add_shape(ShapeKind::Ellipse, 1.0, 2.0);
+        let n = b.add_note(0.0, 0.0);
+        assert!(t != s && s != n && t != n);
+        b.text_mut(t).unwrap().text = "hello\nworld".into();
+        b.shape_mut(s).unwrap().x2 = 50.0;
+        let tj = serde_json::to_string(&b.texts[0]).unwrap();
+        assert_eq!(serde_json::from_str::<TextBox>(&tj).unwrap(), b.texts[0]);
+        let sj = serde_json::to_string(&b.shapes[0]).unwrap();
+        assert!(sj.contains("\"kind\":\"ellipse\""), "{sj}");
+        assert_eq!(serde_json::from_str::<Shape>(&sj).unwrap(), b.shapes[0]);
+        let t2: TextBox = serde_json::from_str(r#"{"id":9,"x":1,"y":2}"#).unwrap();
+        assert_eq!((t2.text.as_str(), t2.color), ("", 0));
+    }
+
+    #[test]
+    fn shape_bbox_is_normalised_whatever_the_drag_direction() {
+        let mut b = Board::new();
+        let s = b.add_shape(ShapeKind::Rect, 100.0, 80.0);
+        let sh = b.shape_mut(s).unwrap();
+        (sh.x2, sh.y2) = (40.0, 20.0);
+        assert_eq!(b.shape(s).unwrap().bbox(), (40.0, 20.0, 60.0, 60.0));
+    }
+
+    #[test]
+    fn history_restores_texts_and_shapes_and_from_parts_cleans_them() {
+        let (mut b, mut h) = (Board::new(), History::new());
+        h.record(&b, None);
+        b.add_text(0.0, 0.0);
+        h.record(&b, None);
+        b.add_shape(ShapeKind::Line, 0.0, 0.0);
+        assert!(h.undo(&mut b));
+        assert!(b.shapes.is_empty() && b.texts.len() == 1);
+        assert!(h.undo(&mut b) && b.texts.is_empty());
+        assert!(h.redo(&mut b) && h.redo(&mut b));
+        assert!(b.texts.len() == 1 && b.shapes.len() == 1);
+        let tx = |id| TextBox {
+            id,
+            x: f32::NAN,
+            y: 1.0,
+            text: String::new(),
+            color: 77,
+            group: 0,
+        };
+        let sp = |id| Shape {
+            id,
+            kind: ShapeKind::Rect,
+            x1: f32::INFINITY,
+            y1: 0.0,
+            x2: 1.0,
+            y2: 1.0,
+            color: 99,
+            group: 0,
+        };
+        let c = Board::from_parts(
+            vec![],
+            vec![],
+            vec![],
+            vec![tx(4), tx(4)],
+            vec![sp(4), sp(4)],
+            1,
+        );
+        assert_ne!(c.texts[0].id, c.texts[1].id);
+        assert_ne!(c.shapes[0].id, c.shapes[1].id);
+        assert!(c.texts[0].x.is_finite() && c.shapes[0].x1.is_finite());
+        assert!(c.texts[0].color < PALETTE_LEN && c.shapes[0].color < PALETTE_LEN);
+        // ids only need to be unique within a kind (every lookup is per kind)
+        assert_eq!((c.texts.len(), c.shapes.len()), (2, 2));
+    }
+
+    #[test]
+    fn grouped_items_move_together_and_ungroup() {
+        use crate::layout::Sel;
+        let mut b = Board::new();
+        let n = b.add_note(0.0, 0.0);
+        let t = b.add_text(100.0, 100.0);
+        let s = b.add_shape(ShapeKind::Rect, 10.0, 10.0);
+        assert!(
+            b.group_items(&[Sel::Note(n)]).is_none(),
+            "one item is no group"
+        );
+        let g = b.group_items(&[Sel::Note(n), Sel::Text(t)]).unwrap();
+        assert_eq!(b.group_members(g).len(), 2);
+        // adding a member of an existing group pulls in the whole group
+        let g2 = b.group_items(&[Sel::Text(t), Sel::Shape(s)]).unwrap();
+        assert_eq!(b.group_members(g2).len(), 3);
+        assert!(b.group_members(g).is_empty());
+        b.translate(Sel::Note(n), 5.0, 6.0);
+        assert_eq!((b.note(n).unwrap().x, b.note(n).unwrap().y), (5.0, 6.0));
+        assert!(b.ungroup(Sel::Shape(s)));
+        assert_eq!(b.group_of(Sel::Note(n)), 0);
     }
 }

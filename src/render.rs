@@ -4,17 +4,20 @@
 //! R, G, B, A. Colours are therefore given to tiny-skia with red and blue swapped (see `bgr`),
 //! so the screen shows the intended colour.
 
-use crate::board::{Area, Background, Board, Note, Stroke, Theme, MAX_HERO_OPEN};
+use crate::board::{
+    Area, Background, Board, Note, Shape, ShapeKind, Stroke, TextBox, Theme, MAX_HERO_OPEN,
+};
 use crate::camera::Camera;
 use crate::editor::{lines_of, scroll_x, style_of, EditTarget, Editor};
 use crate::layout::{
-    area_geom, note_geom, radius, AreaGeom, Overlay, Rect as LRect, Tool, BODY_LINE_H, CIRCLE,
-    NOTE_LINE_H, NOTE_RADIUS, NOTE_TITLE_H, PAD, ROW_H, TEXT_GAP,
+    area_geom, handles, note_geom, radius, text_geom, AreaGeom, Overlay, Rect as LRect, Sel, Tool,
+    ViewBtn, BODY_LINE_H, CIRCLE, NOTE_LINE_H, NOTE_RADIUS, NOTE_TITLE_H, PAD, ROW_H, TEXT_GAP,
+    TEXT_LINE_H,
 };
 use crate::text::{blit, line_of, quantize_px, Face, Fonts, Style, MIN_GLYPH_PX};
 use tiny_skia::{
     Color, FillRule, FilterQuality, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapMut,
-    PixmapPaint, Rect, Stroke as SkStroke, Transform,
+    PixmapPaint, Rect, Stroke as SkStroke, StrokeDash, Transform,
 };
 
 type Rgb = (u8, u8, u8);
@@ -170,6 +173,8 @@ pub struct Scene<'a> {
     pub wallpaper: Option<&'a [u8]>,
     pub overlay: &'a Overlay,
     pub current_area: Option<usize>,
+    /// Draw the keyboard shortcuts popup.
+    pub show_help: bool,
 }
 
 /// Draw the whole frame. `canvas` is `w * h * 4` bytes, `scale` the integer buffer scale.
@@ -209,15 +214,23 @@ pub fn draw(
         return;
     };
 
+    // Shapes sit under the cards so cards stay clickable on top of them.
+    for s in &scene.board.shapes {
+        draw_shape(&mut pm, &v, s, &c);
+    }
     for (ai, a) in scene.board.areas.iter().enumerate() {
         draw_area(&mut pm, &v, fonts, a, ai, scene, &c);
     }
     for n in &scene.board.notes {
         draw_note(&mut pm, &v, fonts, n, scene, &c);
     }
+    for t in &scene.board.texts {
+        draw_free_text(&mut pm, &v, fonts, t, scene, &c);
+    }
     for s in &scene.board.strokes {
         draw_stroke(&mut pm, &v, s, &c);
     }
+    draw_selection(&mut pm, &v, fonts, scene, &c);
     draw_overlay(&mut pm, &v, fonts, scene, &c);
 }
 
@@ -962,6 +975,184 @@ fn draw_stroke(pm: &mut PixmapMut, v: &View, s: &Stroke, c: &Colors) {
     }
 }
 
+fn draw_shape(pm: &mut PixmapMut, v: &View, s: &Shape, c: &Colors) {
+    let col = c.accent[s.color as usize % 10];
+    let tf = Transform::identity();
+    let width = (2.5 * v.z).max(v.hair() * 1.5);
+    let stroke = SkStroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..SkStroke::default()
+    };
+    let (bx, by, bw, bh) = s.bbox();
+    let (x, y, w, h) = (v.x(bx), v.y(by), bw * v.z, bh * v.z);
+    if !v.visible(x - width, y - width, w + 2.0 * width, h + 2.0 * width) {
+        return;
+    }
+    let path = match s.kind {
+        ShapeKind::Rect => rounded_rect(x, y, w.max(1.0), h.max(1.0), 6.0 * v.z),
+        ShapeKind::Ellipse => {
+            Rect::from_xywh(x, y, w.max(1.0), h.max(1.0)).and_then(PathBuilder::from_oval)
+        }
+        ShapeKind::Line => {
+            let mut pb = PathBuilder::new();
+            pb.move_to(v.x(s.x1), v.y(s.y1));
+            pb.line_to(v.x(s.x2), v.y(s.y2));
+            pb.finish()
+        }
+    };
+    let Some(p) = path else {
+        return;
+    };
+    if s.kind != ShapeKind::Line {
+        pm.fill_path(&p, &paint(col, 30, true), FillRule::Winding, tf, None);
+    }
+    pm.stroke_path(&p, &paint(col, 0xff, true), &stroke, tf, None);
+}
+
+fn draw_free_text(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    t: &TextBox,
+    scene: &Scene,
+    c: &Colors,
+) {
+    let g = {
+        let f: &Fonts = fonts;
+        text_geom(t, &|s, ch| f.advance(s.face(), ch, s.size()))
+    };
+    let (x, y, w, h) = v.rect(g.rect);
+    if !v.visible(x, y, w, h) {
+        return;
+    }
+    let chars: Vec<char> = t.text.chars().collect();
+    let px = Style::Free.size() * v.z;
+    let clip = (0.0, v.w as f32);
+    for (li, line) in g.lines.iter().enumerate() {
+        let s: String = chars[line.start..line.end].iter().collect();
+        let cy = v.y(g.rect.y + (li as f32 + 0.5) * TEXT_LINE_H);
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Regular,
+            px,
+            x,
+            cy,
+            &s,
+            c.text,
+            clip,
+            false,
+        );
+    }
+    if let Some(e) = scene.editor.editing {
+        if e.target == EditTarget::FreeText(t.id) {
+            // A faint box shows where the text is while you type.
+            if let Some(p) = rounded_rect(
+                x - 4.0 * v.z,
+                y - 2.0 * v.z,
+                w + 8.0 * v.z,
+                h + 4.0 * v.z,
+                6.0 * v.z,
+            ) {
+                let st = SkStroke {
+                    width: v.hair(),
+                    ..SkStroke::default()
+                };
+                pm.stroke_path(
+                    &p,
+                    &paint(c.accent[0], 0xff, true),
+                    &st,
+                    Transform::identity(),
+                    None,
+                );
+            }
+            if let Some((cx, cy, ch)) = caret_for(
+                v,
+                fonts,
+                scene.board,
+                e.target,
+                e.caret,
+                Some((t.x, t.y, TEXT_LINE_H)),
+            ) {
+                draw_caret(pm, v, cx, cy, ch, c.text);
+            }
+        }
+    }
+}
+
+/// Outline and resize handles of the selected item.
+fn draw_selection(pm: &mut PixmapMut, v: &View, fonts: &Fonts, scene: &Scene, c: &Colors) {
+    let Some(sel) = scene.editor.selected else {
+        return;
+    };
+    let adv = |s: Style, ch: char| fonts.advance(s.face(), ch, s.size());
+    let tf = Transform::identity();
+    let accent = c.accent[0];
+    // Outline every other item in the multi-selection or in the selected item's lock group.
+    let g = scene.board.group_of(sel);
+    let mut others: Vec<Sel> = scene.editor.extra.clone();
+    others.extend(
+        scene
+            .board
+            .group_members(g)
+            .into_iter()
+            .filter(|m| *m != sel),
+    );
+    for o in others {
+        if let Some(r) = crate::layout::selection_rect(scene.board, o, &adv) {
+            let (x, y, w, h) = v.rect(r);
+            if let Some(p) = rounded_rect(
+                x - 3.0 * v.z,
+                y - 3.0 * v.z,
+                w + 6.0 * v.z,
+                h + 6.0 * v.z,
+                8.0 * v.z,
+            ) {
+                let st = SkStroke {
+                    width: v.hair(),
+                    dash: StrokeDash::new(vec![6.0 * v.z, 4.0 * v.z], 0.0),
+                    ..SkStroke::default()
+                };
+                pm.stroke_path(&p, &paint(accent, 0xff, true), &st, tf, None);
+            }
+        }
+    }
+    // A thin outline around cards, notes and texts (shapes already show their own edge).
+    if !matches!(sel, Sel::Shape(_)) && scene.editor.editing.is_none() {
+        if let Some(r) = crate::layout::selection_rect(scene.board, sel, &adv) {
+            let (x, y, w, h) = v.rect(r);
+            if let Some(p) = rounded_rect(
+                x - 3.0 * v.z,
+                y - 3.0 * v.z,
+                w + 6.0 * v.z,
+                h + 6.0 * v.z,
+                8.0 * v.z,
+            ) {
+                let st = SkStroke {
+                    width: v.hair(),
+                    ..SkStroke::default()
+                };
+                pm.stroke_path(&p, &paint(accent, 0xff, true), &st, tf, None);
+            }
+        }
+    }
+    let s = 10.0 * v.scale;
+    for (_, (hx, hy)) in handles(scene.board, sel, &adv) {
+        let (px, py) = (v.x(hx), v.y(hy));
+        if let Some(p) = rounded_rect(px - s / 2.0, py - s / 2.0, s, s, 2.5 * v.scale) {
+            pm.fill_path(&p, &paint(WHITE, 0xff, true), FillRule::Winding, tf, None);
+            let st = SkStroke {
+                width: (1.6 * v.scale).max(1.5),
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint(accent, 0xff, true), &st, tf, None);
+        }
+    }
+}
+
 // ---- overlay (screen space)
 
 fn pill(pm: &mut PixmapMut, v: &View, r: LRect, c: &Colors) {
@@ -1015,6 +1206,25 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
         draw_tool_icon(pm, v, *tool, x + w / 2.0, y + h / 2.0, col);
     }
 
+    // View menu (right edge): zoom in, zoom out, background colour.
+    pill(pm, v, o.view_pill, c);
+    for (btn, rc) in &o.view_btns {
+        let (cx, cy) = ((rc.x + rc.w / 2.0) * s, (rc.y + rc.h / 2.0) * s);
+        match btn {
+            ViewBtn::Help => draw_help_icon(pm, v, fonts, cx, cy, c.secondary),
+            ViewBtn::Background => {
+                // A swatch of the current background: wallpaper shows as the accent colour.
+                let fill = if scene.background.image_on {
+                    c.accent[0]
+                } else {
+                    scene.background.solid().unwrap_or(c.canvas)
+                };
+                draw_swatch(pm, v, cx, cy, fill, c.secondary);
+            }
+            _ => draw_zoom_icon(pm, v, *btn, cx, cy, c.secondary),
+        }
+    }
+
     // Area chips.
     if let Some(p) = o.chips_pill {
         pill(pm, v, p, c);
@@ -1053,34 +1263,175 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
             false,
         );
     }
-
-    // Launcher dock.
-    if let Some(p) = o.dock_pill {
-        pill(pm, v, p, c);
+    if scene.show_help {
+        draw_help(pm, v, fonts, c);
     }
-    for (li, r) in &o.dock {
-        let Some(l) = scene.board.launchers.get(*li) else {
-            continue;
+}
+
+const HELP_LEFT: [(&str, &str); 14] = [
+    ("V", "Select"),
+    ("G", "Group card tool"),
+    ("T", "Todo tool"),
+    ("N", "Note tool"),
+    ("X", "Text tool"),
+    ("R / O / I", "Rectangle / ellipse / line"),
+    ("P / E", "Pen / eraser"),
+    ("1-9", "Jump to a group"),
+    ("0", "Fit everything"),
+    ("+ / -", "Zoom in / out"),
+    ("C", "Capture"),
+    ("L", "Light / dark theme"),
+    ("B", "Cycle background"),
+    ("?", "This help"),
+];
+const HELP_RIGHT: [(&str, &str); 14] = [
+    ("Shift+click", "Add to selection"),
+    ("Ctrl+G", "Lock selection together"),
+    ("Ctrl+Shift+G", "Unlock group"),
+    ("Delete", "Remove selected"),
+    ("Esc", "Deselect / close"),
+    ("Ctrl+Z", "Undo"),
+    ("Ctrl+Y", "Redo"),
+    ("Ctrl+Enter", "Toggle todo done"),
+    ("Ctrl+P", "Cycle priority"),
+    ("Double-click", "Edit / new group"),
+    ("Right-click", "Remove item"),
+    ("Scroll / drag", "Pan the canvas"),
+    ("Ctrl+scroll", "Zoom"),
+    ("Ctrl+Q", "Quit"),
+];
+
+/// A question mark drawn as text, centred on (cx, cy).
+fn draw_help_icon(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, cx: f32, cy: f32, color: Rgb) {
+    let px = 20.0 * v.scale;
+    let tw = fonts.text_width(Face::Bold, "?", px);
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Bold,
+        px,
+        cx - tw / 2.0,
+        cy,
+        "?",
+        color,
+        (0.0, v.w as f32),
+        false,
+    );
+}
+
+/// The centred keyboard shortcuts popup.
+fn draw_help(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, c: &Colors) {
+    let s = v.scale;
+    let tf = Transform::identity();
+    let (vw, vh) = (v.w as f32 / s, v.h as f32 / s);
+    let (col_w, row_h, pad) = (300.0_f32, 26.0_f32, 24.0_f32);
+    let pw = (2.0 * col_w + 3.0 * pad).min(vw - 20.0);
+    let ph = (HELP_LEFT.len() as f32 * row_h + 2.0 * pad + 40.0).min(vh - 20.0);
+    let (px, py) = ((vw - pw) / 2.0, (vh - ph) / 2.0);
+    if let Some(p) = rounded_rect(0.0, 0.0, v.w as f32, v.h as f32, 0.0) {
+        pm.fill_path(&p, &paint((0, 0, 0), 90, true), FillRule::Winding, tf, None);
+    }
+    if let Some(p) = rounded_rect(px * s, py * s, pw * s, ph * s, 16.0 * s) {
+        pm.fill_path(&p, &paint(c.card, 0xff, true), FillRule::Winding, tf, None);
+        let st = SkStroke {
+            width: v.hair(),
+            ..SkStroke::default()
         };
-        let (x, y, w, h) = (r.x * s, r.y * s, r.w * s, r.h * s);
-        if let Some(p) = rounded_rect(x, y, w, h, h / 2.0) {
-            pm.fill_path(&p, &paint(c.hover, 0xff, true), FillRule::Winding, tf, None);
+        pm.stroke_path(&p, &paint(c.sep, 0xff, true), &st, tf, None);
+    }
+    let full = (0.0, v.w as f32);
+    let size = 14.0 * s;
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Bold,
+        17.0 * s,
+        (px + pad) * s,
+        (py + pad + 10.0) * s,
+        "Keyboard shortcuts",
+        c.text,
+        full,
+        false,
+    );
+    for (ci, list) in [&HELP_LEFT, &HELP_RIGHT].into_iter().enumerate() {
+        let x = px + pad + ci as f32 * (col_w + pad);
+        for (i, (k, d)) in list.iter().enumerate() {
+            let y = py + pad + 44.0 + i as f32 * row_h;
+            text_px(
+                pm,
+                v,
+                fonts,
+                Face::Bold,
+                size,
+                x * s,
+                y * s,
+                k,
+                c.accent[0],
+                full,
+                false,
+            );
+            text_px(
+                pm,
+                v,
+                fonts,
+                Face::Regular,
+                size,
+                (x + 112.0) * s,
+                y * s,
+                d,
+                c.secondary,
+                full,
+                false,
+            );
         }
-        let px = Style::Chip.size() * s;
-        let tw = fonts.text_width(Face::Regular, &l.label, px);
-        text_px(
-            pm,
-            v,
-            fonts,
-            Face::Regular,
-            px,
-            x + (w - tw) / 2.0,
-            y + h / 2.0,
-            &l.label,
-            c.text,
-            full,
-            false,
-        );
+    }
+}
+
+/// The background button: a ring around a filled swatch of the current background colour.
+fn draw_swatch(pm: &mut PixmapMut, v: &View, cx: f32, cy: f32, fill: Rgb, ring: Rgb) {
+    let u = v.scale;
+    let tf = Transform::identity();
+    if let Some(p) = PathBuilder::from_circle(cx, cy, 7.0 * u) {
+        pm.fill_path(&p, &paint(fill, 0xff, true), FillRule::Winding, tf, None);
+    }
+    if let Some(p) = PathBuilder::from_circle(cx, cy, 9.5 * u) {
+        let st = SkStroke {
+            width: 1.8 * u,
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(ring, 0xff, true), &st, tf, None);
+    }
+}
+
+/// A magnifier with a plus (zoom in) or a minus (zoom out), in a 24x24 box centred on (cx, cy).
+fn draw_zoom_icon(pm: &mut PixmapMut, v: &View, btn: ViewBtn, cx: f32, cy: f32, color: Rgb) {
+    let u = v.scale;
+    let tf = Transform::identity();
+    let stroke = SkStroke {
+        width: 1.8 * u,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..SkStroke::default()
+    };
+    // Lens centred a little up-left, handle to the lower right.
+    let (lx, ly, r) = (cx - 2.0 * u, cy - 2.0 * u, 7.5 * u);
+    if let Some(p) = PathBuilder::from_circle(lx, ly, r) {
+        pm.stroke_path(&p, &paint(color, 0xff, true), &stroke, tf, None);
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(lx + r * 0.72, ly + r * 0.72);
+    pb.line_to(cx + 9.0 * u, cy + 9.0 * u);
+    // the horizontal bar of the +/- inside the lens
+    pb.move_to(lx - 3.6 * u, ly);
+    pb.line_to(lx + 3.6 * u, ly);
+    if btn == ViewBtn::ZoomIn {
+        pb.move_to(lx, ly - 3.6 * u);
+        pb.line_to(lx, ly + 3.6 * u);
+    }
+    if let Some(path) = pb.finish() {
+        pm.stroke_path(&path, &paint(color, 0xff, true), &stroke, tf, None);
     }
 }
 
@@ -1190,6 +1541,26 @@ fn draw_tool_icon(pm: &mut PixmapMut, v: &View, tool: Tool, cx: f32, cy: f32, co
             );
             line(pm, &[(15.0, 8.0), (17.0, 10.0)], false);
         }
+        Tool::Text => {
+            // a capital T
+            line(pm, &[(6.0, 6.5), (18.0, 6.5)], false);
+            line(pm, &[(12.0, 6.5), (12.0, 19.0)], false);
+        }
+        Tool::Rect => {
+            if let Some(path) =
+                rounded_rect(ox + 4.5 * u, oy + 6.0 * u, 15.0 * u, 12.0 * u, 2.5 * u)
+            {
+                pm.stroke_path(&path, &paint(color, 0xff, true), &stroke, tf, None);
+            }
+        }
+        Tool::Ellipse => {
+            if let Some(path) = Rect::from_xywh(ox + 4.0 * u, oy + 6.0 * u, 16.0 * u, 12.0 * u)
+                .and_then(PathBuilder::from_oval)
+            {
+                pm.stroke_path(&path, &paint(color, 0xff, true), &stroke, tf, None);
+            }
+        }
+        Tool::Line => line(pm, &[(5.5, 18.5), (18.5, 5.5)], false),
         Tool::Eraser => {
             line(
                 pm,
@@ -1328,6 +1699,7 @@ mod tests {
                 wallpaper: self.wp.as_deref(),
                 overlay: &ov,
                 current_area: Some(1),
+                show_help: false,
             };
             let mut buf = vec![0u8; (self.w * self.h * 4) as usize];
             draw(
@@ -1656,6 +2028,181 @@ mod tests {
     }
 
     #[test]
+    fn view_menu_draws_zoom_icons_and_a_background_swatch() {
+        let r = Rig::new();
+        let buf = r.frame();
+        let mut f = fonts();
+        let ov = overlay(
+            &r.board,
+            r.w as f32,
+            r.h as f32,
+            crate::layout::Margins::default(),
+            &|s, t| f.text_width(s.face(), t, s.size()),
+        );
+        let _ = &mut f;
+        let sec = colors(Theme::Dark).secondary;
+        let icon_px = |rc: LRect| {
+            (rc.x as u32..rc.right() as u32)
+                .flat_map(|x| (rc.y as u32..rc.bottom() as u32).map(move |y| (x, y)))
+                .filter(|&(x, y)| {
+                    let p = px(&buf, r.w, x, y);
+                    p.0 > sec.0 - 25 && p.0 < sec.0 + 25 && p.2 > sec.2 - 25 && p.2 < sec.2 + 25
+                })
+                .count()
+        };
+        let (zin, zout) = (ov.view_btns[0].1, ov.view_btns[1].1);
+        let (a, b) = (icon_px(zin), icon_px(zout));
+        assert!(
+            a > 15 && b > 15,
+            "both buttons have icon pixels: in={a} out={b}"
+        );
+        assert!(
+            a > b,
+            "the plus has more ink than the minus: in={a} out={b}"
+        );
+        // the pill itself is drawn (not plain canvas)
+        let pill = ov.view_pill;
+        assert_ne!(
+            px(
+                &buf,
+                r.w,
+                (pill.x + 3.0) as u32,
+                (pill.y + pill.h / 2.0) as u32
+            ),
+            colors(Theme::Dark).canvas
+        );
+    }
+
+    #[test]
+    fn background_button_shows_a_swatch_of_the_current_background() {
+        let mut r = Rig::new();
+        let mut f = fonts();
+        let ov = overlay(
+            &r.board,
+            r.w as f32,
+            r.h as f32,
+            crate::layout::Margins::default(),
+            &|s, t| f.text_width(s.face(), t, s.size()),
+        );
+        let _ = &mut f;
+        let (_, rc) = ov.view_btns[2];
+        let centre = |buf: &[u8]| {
+            px(
+                buf,
+                r.w,
+                (rc.x + rc.w / 2.0) as u32,
+                (rc.y + rc.h / 2.0) as u32,
+            )
+        };
+        assert_eq!(
+            centre(&r.frame()),
+            colors(Theme::Dark).canvas,
+            "default: the theme canvas colour"
+        );
+        r.bg.color = Some("#14211A".into());
+        assert_eq!(
+            centre(&r.frame()),
+            (0x14, 0x21, 0x1a),
+            "a solid colour shows as that colour"
+        );
+        r.bg.color = None;
+        r.bg.image_on = true;
+        assert_eq!(
+            centre(&r.frame()),
+            colors(Theme::Dark).accent[0],
+            "a wallpaper shows as the accent swatch"
+        );
+    }
+
+    #[test]
+    fn shapes_free_text_and_handles_are_drawn() {
+        let mut r = Rig::new();
+        r.board = Board::new();
+        r.cam = Camera {
+            x: -50.0,
+            y: -50.0,
+            zoom: 1.0,
+        };
+        let blue = colors(Theme::Dark).accent[0];
+        let rect = r
+            .board
+            .add_shape(crate::board::ShapeKind::Rect, 200.0, 200.0);
+        r.board.shape_mut(rect).unwrap().x2 = 400.0;
+        r.board.shape_mut(rect).unwrap().y2 = 320.0;
+        let oval = r
+            .board
+            .add_shape(crate::board::ShapeKind::Ellipse, 500.0, 200.0);
+        r.board.shape_mut(oval).unwrap().x2 = 700.0;
+        r.board.shape_mut(oval).unwrap().y2 = 320.0;
+        let line = r
+            .board
+            .add_shape(crate::board::ShapeKind::Line, 200.0, 500.0);
+        r.board.shape_mut(line).unwrap().x2 = 400.0;
+        r.board.shape_mut(line).unwrap().y2 = 500.0;
+        let t = r.board.add_text(500.0, 450.0);
+        r.board.text_mut(t).unwrap().text = "Hello free text".into();
+        let buf = r.frame();
+        // the rectangle's top edge (centre of the stroke at y = 200 -> screen 250)
+        let top = px(&buf, r.w, 300 + 50, 250);
+        assert!(
+            top.2 > 150 && top.0 < 100,
+            "rect outline is blue: {top:?} vs {blue:?}"
+        );
+        // inside the rectangle: a faint blue tint over the canvas, not the plain canvas colour
+        let inside = px(&buf, r.w, 300 + 50, 260 + 50);
+        assert_ne!(inside, colors(Theme::Dark).canvas, "translucent fill");
+        // the ellipse outline at its left-most point
+        let oval_edge = px(&buf, r.w, 500 + 50, 260 + 50);
+        assert!(oval_edge.2 > 120, "ellipse outline: {oval_edge:?}");
+        // the ellipse does NOT cover its bounding-box corner
+        assert_eq!(
+            px(&buf, r.w, 503 + 50, 203 + 50),
+            colors(Theme::Dark).canvas
+        );
+        // the line
+        assert!(px(&buf, r.w, 300 + 50, 500 + 50).2 > 150, "line stroke");
+        // free text pixels (white on dark)
+        let bright = (500 + 50..620 + 50)
+            .flat_map(|x| (450 + 50..478 + 50).map(move |y| (x, y)))
+            .filter(|&(x, y)| px(&buf, r.w, x, y).0 > 0xc0)
+            .count();
+        assert!(bright > 40, "free text glyphs: {bright}");
+        // selected shape shows white handle squares with an accent edge
+        r.editor.selected = Some(Sel::Shape(rect));
+        let buf = r.frame();
+        assert_eq!(
+            px(&buf, r.w, 200 + 50, 200 + 50 - 1),
+            (0xff, 0xff, 0xff),
+            "handle centre is white"
+        );
+    }
+
+    #[test]
+    fn resized_card_is_drawn_at_its_new_width() {
+        let mut r = Rig::new();
+        r.board = Board::new();
+        r.cam = Camera {
+            x: -50.0,
+            y: -50.0,
+            zoom: 1.0,
+        };
+        let id = r.board.add_area(0.0, 0.0);
+        r.board.area_mut(id).unwrap().w = 600.0;
+        let buf = r.frame();
+        let card = colors(Theme::Dark).card;
+        assert_eq!(
+            px(&buf, r.w, 50 + 560, 50 + 100),
+            card,
+            "inside the widened card"
+        );
+        assert_eq!(
+            px(&buf, r.w, 50 + 640, 50 + 100),
+            colors(Theme::Dark).canvas,
+            "and nothing beyond it"
+        );
+    }
+
+    #[test]
     fn current_chip_is_filled_with_its_area_colour() {
         let r = Rig::new();
         let buf = r.frame();
@@ -1838,6 +2385,7 @@ mod dump {
                 wallpaper: None,
                 overlay: &ov,
                 current_area: Some(1),
+                show_help: false,
             };
             let mut buf = vec![0u8; (w * h * 4) as usize];
             draw(

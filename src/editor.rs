@@ -2,9 +2,13 @@
 //! undo bookkeeping. Pure logic: takes decoded input and a char-advance function, so it can be
 //! unit-tested without Wayland or fonts.
 
-use crate::board::{Board, History, Todo};
+use crate::board::{Board, History, ShapeKind, Todo, DEFAULT_SHAPE};
+use crate::board::{MAX_W, MIN_AREA_W, MIN_NOTE_W};
 use crate::camera::Camera;
-use crate::layout::{area_geom, hit_test, note_geom, Adv, Target, Tool};
+use crate::layout::{
+    area_geom, hit_handle, hit_test, note_geom, text_geom, Adv, Handle, Sel, Target, Tool,
+    TEXT_LINE_H,
+};
 use crate::text::{index_at_x, line_of, Style};
 
 /// Pointer must travel this many screen px before a press on a card becomes a drag.
@@ -14,6 +18,8 @@ const DOUBLE_CLICK_MS: u32 = 400;
 const DOUBLE_CLICK_PX: f32 = 8.0;
 /// Pen points closer than this many screen px to the previous one are dropped.
 const PEN_MIN_STEP_PX: f32 = 2.0;
+/// Resize handles can be grabbed within this many screen px.
+pub const HANDLE_PX: f32 = 12.0;
 /// Eraser radius in screen px.
 const ERASER_PX: f32 = 9.0;
 
@@ -53,12 +59,17 @@ pub enum EditTarget {
     TodoBody(u64, usize),
     NoteTitle(u64),
     NoteBody(u64),
+    /// Free text on the canvas.
+    FreeText(u64),
 }
 
 impl EditTarget {
     fn owner(self) -> u64 {
         match self {
-            EditTarget::AreaTitle(i) | EditTarget::NoteTitle(i) | EditTarget::NoteBody(i) => i,
+            EditTarget::AreaTitle(i)
+            | EditTarget::NoteTitle(i)
+            | EditTarget::NoteBody(i)
+            | EditTarget::FreeText(i) => i,
             EditTarget::TodoText(i, _) | EditTarget::TodoBody(i, _) => i,
         }
     }
@@ -68,12 +79,16 @@ impl EditTarget {
             EditTarget::AreaTitle(_) => 0,
             EditTarget::NoteTitle(_) => 1,
             EditTarget::NoteBody(_) => 2,
+            EditTarget::FreeText(_) => 5_000_000,
             EditTarget::TodoText(_, r) => 3 + 2 * r,
             EditTarget::TodoBody(_, r) => 4 + 2 * r,
         }
     }
     fn multiline(self) -> bool {
-        matches!(self, EditTarget::TodoBody(..) | EditTarget::NoteBody(_))
+        matches!(
+            self,
+            EditTarget::TodoBody(..) | EditTarget::NoteBody(_) | EditTarget::FreeText(_)
+        )
     }
 }
 
@@ -88,6 +103,12 @@ pub struct Edit {
 enum Mover {
     Area(u64),
     Note(u64),
+    Text(u64),
+    /// A shape, with its original end points so a move is exact however far the pointer went.
+    Shape {
+        id: u64,
+        orig: (f32, f32, f32, f32),
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +131,18 @@ enum Drag {
     Draw {
         id: u64,
     },
+    /// Dragging out a new shape.
+    DrawShape {
+        id: u64,
+    },
+    /// Dragging a resize handle of the selected item.
+    Resize {
+        sel: Sel,
+        handle: Handle,
+        /// (x, width, 0, 0) for cards and notes; (x1, y1, x2, y2) for shapes.
+        orig: (f32, f32, f32, f32),
+        recorded: bool,
+    },
     Erase {
         recorded: bool,
     },
@@ -120,11 +153,18 @@ enum Drag {
 enum Removed {
     Todo { area: usize, row: usize },
     Note { index: usize },
+    Text { index: usize },
 }
 
 #[derive(Debug)]
 pub struct Editor {
     pub tool: Tool,
+    /// The selected item (shows resize handles; Delete removes it).
+    pub selected: Option<Sel>,
+    /// Extra items added with Shift+click, to be locked together with `selected` (Ctrl+G).
+    pub extra: Vec<Sel>,
+    /// Shift is held (set by the app).
+    pub shift: bool,
     pub editing: Option<Edit>,
     drag: Drag,
     last_click: Option<(u32, f32, f32)>,
@@ -155,6 +195,7 @@ pub fn text_of(board: &Board, t: EditTarget) -> Option<&str> {
         EditTarget::TodoBody(id, r) => board.area(id)?.todos.get(r)?.body.as_deref(),
         EditTarget::NoteTitle(id) => board.note(id).map(|n| n.title.as_str()),
         EditTarget::NoteBody(id) => board.note(id).map(|n| n.body.as_str()),
+        EditTarget::FreeText(id) => board.text(id).map(|t| t.text.as_str()),
     }
 }
 
@@ -165,6 +206,7 @@ fn text_mut(board: &mut Board, t: EditTarget) -> Option<&mut String> {
         EditTarget::TodoBody(id, r) => board.area_mut(id)?.todos.get_mut(r)?.body.as_mut(),
         EditTarget::NoteTitle(id) => board.note_mut(id).map(|n| &mut n.title),
         EditTarget::NoteBody(id) => board.note_mut(id).map(|n| &mut n.body),
+        EditTarget::FreeText(id) => board.text_mut(id).map(|t| &mut t.text),
     }
 }
 
@@ -182,6 +224,7 @@ pub fn style_of(board: &Board, t: EditTarget) -> Style {
         EditTarget::TodoBody(..) => Style::Chip,
         EditTarget::NoteTitle(_) => Style::Title,
         EditTarget::NoteBody(_) => Style::Row,
+        EditTarget::FreeText(_) => Style::Free,
     }
 }
 
@@ -198,6 +241,7 @@ pub fn lines_of(board: &Board, t: EditTarget, adv: Adv) -> Option<Vec<crate::tex
                 .map(|b| b.lines.clone())
         }
         EditTarget::NoteBody(id) => Some(note_geom(board.note(id)?, adv).body.lines),
+        EditTarget::FreeText(id) => Some(text_geom(board.text(id)?, adv).lines),
         _ => None,
     }
 }
@@ -206,6 +250,9 @@ impl Editor {
     pub fn new() -> Self {
         Editor {
             tool: Tool::Select,
+            selected: None,
+            extra: Vec::new(),
+            shift: false,
             editing: None,
             drag: Drag::None,
             last_click: None,
@@ -287,6 +334,17 @@ impl Editor {
                 }
                 None
             }
+            EditTarget::FreeText(id) => {
+                let empty = board.text(id).is_some_and(|t| t.text.is_empty());
+                if empty {
+                    self.history.record(board, None);
+                    let ti = board.texts.iter().position(|t| t.id == id)?;
+                    board.texts.remove(ti);
+                    self.modified = true;
+                    return Some(Removed::Text { index: ti });
+                }
+                None
+            }
             EditTarget::AreaTitle(_) => None,
         }
     }
@@ -328,6 +386,13 @@ impl Editor {
                         Target::NoteBody(_) => Target::NoteBody(n2),
                         _ => Target::NoteDot(n2),
                     })
+                }
+            }
+            (Target::FreeText(n), Removed::Text { index }) => {
+                if n == index {
+                    None
+                } else {
+                    Some(Target::FreeText(if n > index { n - 1 } else { n }))
                 }
             }
             (
@@ -379,6 +444,15 @@ impl Editor {
         self.start_editing(EditTarget::TodoText(id, at), 0);
         self.modified = true;
         true
+    }
+
+    /// New free text at a world point; typing starts immediately.
+    pub fn create_text_at(&mut self, board: &mut Board, wx: f32, wy: f32) -> u64 {
+        self.history.record(board, None);
+        let id = board.add_text(wx, wy);
+        self.start_editing(EditTarget::FreeText(id), 0);
+        self.modified = true;
+        id
     }
 
     // ---- pointer
@@ -439,7 +513,22 @@ impl Editor {
                     self.modified = true;
                 }
             }
+            Target::FreeText(ti) => {
+                if ti < board.texts.len() {
+                    self.history.record(board, None);
+                    board.texts.remove(ti);
+                    self.modified = true;
+                }
+            }
+            Target::Shape(si) => {
+                if si < board.shapes.len() {
+                    self.history.record(board, None);
+                    board.shapes.remove(si);
+                    self.modified = true;
+                }
+            }
         }
+        self.validate_selection(board);
         true
     }
 
@@ -473,8 +562,19 @@ impl Editor {
                 self.erase_at(board, wx, wy, ERASER_PX / cam.zoom);
                 true
             }
-            Tool::Group | Tool::Note | Tool::Todo => self.place_press(board, wx, wy, adv),
-            Tool::Select => self.select_press(board, p, (wx, wy), double, adv),
+            Tool::Rect | Tool::Ellipse | Tool::Line => {
+                self.finish_edit(board);
+                self.history.record(board, None);
+                let kind = self.tool.shape_kind().unwrap_or(ShapeKind::Rect);
+                let id = board.add_shape(kind, wx, wy);
+                self.drag = Drag::DrawShape { id };
+                self.modified = true;
+                true
+            }
+            Tool::Group | Tool::Note | Tool::Todo | Tool::Text => {
+                self.place_press(board, wx, wy, adv)
+            }
+            Tool::Select => self.select_press(board, p, (wx, wy), double, cam.zoom, adv),
         }
     }
 
@@ -491,6 +591,17 @@ impl Editor {
             Tool::Note if tgt.is_none() => {
                 self.create_note_at(board, wx, wy);
             }
+            Tool::Text => match tgt {
+                None => {
+                    self.create_text_at(board, wx, wy);
+                }
+                Some(Target::FreeText(ti)) => {
+                    if let Some(id) = board.texts.get(ti).map(|t| t.id) {
+                        self.start_editing_end(board, EditTarget::FreeText(id));
+                    }
+                }
+                _ => return true, // a Text click on a card does nothing; keep the tool
+            },
             Tool::Todo => {
                 let ai = match tgt {
                     Some(
@@ -521,9 +632,46 @@ impl Editor {
         p: (f32, f32),
         (wx, wy): (f32, f32),
         double: bool,
+        zoom: f32,
         adv: Adv,
     ) -> bool {
+        // A grab on a resize handle of the selected item wins over everything else.
+        if let Some(sel) = self.selected {
+            if let Some(handle) = hit_handle(board, sel, wx, wy, HANDLE_PX / zoom, adv) {
+                self.finish_edit(board);
+                if let Some(orig) = Self::resize_orig(board, sel) {
+                    self.drag = Drag::Resize {
+                        sel,
+                        handle,
+                        orig,
+                        recorded: false,
+                    };
+                    return true;
+                }
+            }
+        }
         let tgt = hit_test(board, wx, wy, adv);
+        // Shift+click builds a multi-selection for grouping.
+        if self.shift {
+            if let Some(sel) = tgt.and_then(|t| Self::sel_of(board, t)) {
+                self.finish_edit(board);
+                if let Some(cur) = self.selected {
+                    if cur == sel {
+                        self.selected = self.extra.pop();
+                    } else if let Some(i) = self.extra.iter().position(|e| *e == sel) {
+                        self.extra.remove(i);
+                    } else {
+                        self.extra.push(sel);
+                    }
+                } else {
+                    self.selected = Some(sel);
+                }
+                return true;
+            }
+        }
+        if !self.extra.is_empty() {
+            self.extra.clear();
+        }
         // A click inside the field already being edited only moves the caret.
         let wanted = tgt.and_then(|t| Self::edit_target_of(board, t));
         let keep_edit = wanted.is_some() && wanted == self.editing.map(|e| e.target);
@@ -534,10 +682,12 @@ impl Editor {
         };
         let Some(tgt) = Self::remap(tgt, removed) else {
             if tgt.is_none() {
+                self.selected = None;
                 return self.empty_press(board, p, (wx, wy), double);
             }
             return true;
         };
+        self.selected = Self::sel_of(board, tgt);
 
         match tgt {
             Target::Dot(ai) => {
@@ -603,8 +753,228 @@ impl Editor {
                     self.start_editing(t, caret);
                 }
             }
+            Target::FreeText(ti) => {
+                let Some(id) = board.texts.get(ti).map(|t| t.id) else {
+                    return true;
+                };
+                if keep_edit {
+                    let t = EditTarget::FreeText(id);
+                    let caret = self.caret_for(board, t, (wx, wy), adv);
+                    self.start_editing(t, caret);
+                } else if let Some(t) = board.text(id) {
+                    self.drag = Drag::Pending {
+                        who: Mover::Text(id),
+                        start: p,
+                        off: (wx - t.x, wy - t.y),
+                    };
+                }
+            }
+            Target::Shape(si) => {
+                let Some(s) = board.shapes.get(si) else {
+                    return true;
+                };
+                if double {
+                    let id = s.id;
+                    self.history.record(board, None);
+                    if let Some(s) = board.shape_mut(id) {
+                        s.color = (s.color + 1) % crate::board::PALETTE_LEN;
+                    }
+                    self.modified = true;
+                } else {
+                    self.drag = Drag::Pending {
+                        who: Mover::Shape {
+                            id: s.id,
+                            orig: (s.x1, s.y1, s.x2, s.y2),
+                        },
+                        start: p,
+                        off: (wx, wy),
+                    };
+                }
+            }
             Target::Body(_) => self.drag = Drag::Pan { last: p },
         }
+        true
+    }
+
+    /// The selection a hit puts the item under the pointer into.
+    fn sel_of(board: &Board, t: Target) -> Option<Sel> {
+        Some(match t {
+            Target::Title(a)
+            | Target::Dot(a)
+            | Target::NewTodo(a)
+            | Target::Body(a)
+            | Target::Circle(a, _)
+            | Target::Text(a, _)
+            | Target::Prio(a, _)
+            | Target::TodoBody(a, _) => Sel::Area(board.areas.get(a)?.id),
+            Target::NoteTitle(n) | Target::NoteBody(n) | Target::NoteDot(n) => {
+                Sel::Note(board.notes.get(n)?.id)
+            }
+            Target::FreeText(i) => Sel::Text(board.texts.get(i)?.id),
+            Target::Shape(i) => Sel::Shape(board.shapes.get(i)?.id),
+        })
+    }
+
+    /// The starting geometry a resize drag works from.
+    fn resize_orig(board: &Board, sel: Sel) -> Option<(f32, f32, f32, f32)> {
+        Some(match sel {
+            Sel::Area(id) => {
+                let a = board.area(id)?;
+                (a.x, a.width(), 0.0, 0.0)
+            }
+            Sel::Note(id) => {
+                let n = board.note(id)?;
+                (n.x, n.width(), 0.0, 0.0)
+            }
+            Sel::Shape(id) => {
+                let s = board.shape(id)?;
+                (s.x1, s.y1, s.x2, s.y2)
+            }
+            Sel::Text(_) => return None,
+        })
+    }
+
+    /// Drop the selection if its item no longer exists.
+    fn validate_selection(&mut self, board: &Board) {
+        let alive = match self.selected {
+            None => true,
+            Some(Sel::Area(id)) => board.area(id).is_some(),
+            Some(Sel::Note(id)) => board.note(id).is_some(),
+            Some(Sel::Shape(id)) => board.shape(id).is_some(),
+            Some(Sel::Text(id)) => board.text(id).is_some(),
+        };
+        if !alive {
+            self.selected = None;
+        }
+    }
+
+    /// Escape with nothing being edited: drop the selection. True if something changed.
+    pub fn deselect(&mut self) -> bool {
+        let had = !self.extra.is_empty();
+        self.extra.clear();
+        self.selected.take().is_some() || had
+    }
+
+    /// Ctrl+G: lock the multi-selection (or the selected item's group) together.
+    pub fn group_selected(&mut self, board: &mut Board) -> bool {
+        let Some(first) = self.selected else {
+            return false;
+        };
+        if self.extra.is_empty() {
+            return false;
+        }
+        let mut items = vec![first];
+        items.extend(self.extra.iter().copied());
+        self.history.record(board, None);
+        board.group_items(&items);
+        self.extra.clear();
+        self.modified = true;
+        true
+    }
+
+    /// Ctrl+Shift+G: release the selected item's group.
+    pub fn ungroup_selected(&mut self, board: &mut Board) -> bool {
+        let Some(first) = self.selected else {
+            return false;
+        };
+        if board.group_of(first) == 0 {
+            return false;
+        }
+        self.history.record(board, None);
+        board.ungroup(first);
+        self.modified = true;
+        true
+    }
+
+    /// Delete key: remove the selected item (a card only if it is empty, like right-click).
+    pub fn delete_selected(&mut self, board: &mut Board) -> bool {
+        let Some(sel) = self.selected else {
+            return false;
+        };
+        let ok = match sel {
+            Sel::Area(id) => board.area(id).is_some_and(|a| a.todos.is_empty()),
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+        self.history.record(board, None);
+        match sel {
+            Sel::Area(id) => board.areas.retain(|a| a.id != id),
+            Sel::Note(id) => board.notes.retain(|n| n.id != id),
+            Sel::Shape(id) => board.shapes.retain(|s| s.id != id),
+            Sel::Text(id) => board.texts.retain(|t| t.id != id),
+        }
+        self.selected = None;
+        self.modified = true;
+        true
+    }
+
+    /// Apply a handle drag: cards and notes change width (height follows content), shapes move
+    /// the grabbed corner or end point.
+    fn apply_resize(
+        &mut self,
+        board: &mut Board,
+        sel: Sel,
+        handle: Handle,
+        orig: (f32, f32, f32, f32),
+        (wx, wy): (f32, f32),
+    ) -> bool {
+        match sel {
+            Sel::Area(_) | Sel::Note(_) => {
+                let (ox, ow) = (orig.0, orig.1);
+                let (min, id_area) = match sel {
+                    Sel::Area(_) => (MIN_AREA_W, true),
+                    _ => (MIN_NOTE_W, false),
+                };
+                // The opposite edge stays put.
+                let (left, right) = (ox, ox + ow);
+                let (nl, nr) = if handle.is_left() {
+                    (wx.min(right - min), right)
+                } else {
+                    (left, wx.max(left + min))
+                };
+                let w = (nr - nl).clamp(min, MAX_W);
+                let x = if handle.is_left() { right - w } else { left };
+                match sel {
+                    Sel::Area(id) if id_area => {
+                        if let Some(a) = board.area_mut(id) {
+                            (a.x, a.w) = (x, w);
+                        }
+                    }
+                    Sel::Note(id) => {
+                        if let Some(n) = board.note_mut(id) {
+                            (n.x, n.w) = (x, w);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Sel::Shape(id) => {
+                let Some(s) = board.shape_mut(id) else {
+                    return false;
+                };
+                let (x1, y1, x2, y2) = orig;
+                match handle {
+                    Handle::End1 => (s.x1, s.y1) = (wx, wy),
+                    Handle::End2 => (s.x2, s.y2) = (wx, wy),
+                    corner => {
+                        let (lx, rx) = (x1.min(x2), x1.max(x2));
+                        let (ty, by) = (y1.min(y2), y1.max(y2));
+                        // The corner opposite the grabbed one stays fixed.
+                        let (fx, fy) = match corner {
+                            Handle::TopLeft => (rx, by),
+                            Handle::TopRight => (lx, by),
+                            Handle::BottomLeft => (rx, ty),
+                            _ => (lx, ty),
+                        };
+                        (s.x1, s.y1, s.x2, s.y2) = (fx.min(wx), fy.min(wy), fx.max(wx), fy.max(wy));
+                    }
+                }
+            }
+            Sel::Text(_) => return false,
+        }
+        self.modified = true;
         true
     }
 
@@ -631,6 +1001,7 @@ impl Editor {
             Target::TodoBody(ai, ri) => EditTarget::TodoBody(board.areas.get(ai)?.id, ri),
             Target::NoteTitle(ni) => EditTarget::NoteTitle(board.notes.get(ni)?.id),
             Target::NoteBody(ni) => EditTarget::NoteBody(board.notes.get(ni)?.id),
+            Target::FreeText(ti) => EditTarget::FreeText(board.texts.get(ti)?.id),
             _ => return None,
         })
     }
@@ -713,6 +1084,13 @@ impl Editor {
                 let g = note_geom(n, adv);
                 index_at_x(text, wx - g.title.x, &a)
             }
+            EditTarget::FreeText(id) => {
+                let Some(t) = board.text(id) else {
+                    return 0;
+                };
+                let g = text_geom(t, adv);
+                caret_in_block(text, &g.lines, g.rect.x, g.rect.y, TEXT_LINE_H, wx, wy, &a)
+            }
         }
     }
 
@@ -736,6 +1114,31 @@ impl Editor {
                 self.apply_move(board, who, off, wx, wy)
             }
             Drag::Move { who, off } => self.apply_move(board, who, off, wx, wy),
+            Drag::DrawShape { id } => match board.shape_mut(id) {
+                Some(s) => {
+                    (s.x2, s.y2) = (wx, wy);
+                    self.modified = true;
+                    true
+                }
+                None => false,
+            },
+            Drag::Resize {
+                sel,
+                handle,
+                orig,
+                recorded,
+            } => {
+                if !recorded {
+                    self.history.record(board, None);
+                    self.drag = Drag::Resize {
+                        sel,
+                        handle,
+                        orig,
+                        recorded: true,
+                    };
+                }
+                self.apply_resize(board, sel, handle, orig, (wx, wy))
+            }
             Drag::Draw { id } => {
                 let min = PEN_MIN_STEP_PX / cam.zoom;
                 if let Some(s) = board.stroke_mut(id) {
@@ -763,6 +1166,42 @@ impl Editor {
         wx: f32,
         wy: f32,
     ) -> bool {
+        let sel = match who {
+            Mover::Area(id) => Sel::Area(id),
+            Mover::Note(id) => Sel::Note(id),
+            Mover::Text(id) => Sel::Text(id),
+            Mover::Shape { id, .. } => Sel::Shape(id),
+        };
+        let before = Self::origin_of(board, sel);
+        let moved = self.apply_move_one(board, who, off, wx, wy);
+        if let (true, Some(b), Some(a)) = (moved, before, Self::origin_of(board, sel)) {
+            let g = board.group_of(sel);
+            for m in board.group_members(g) {
+                if m != sel {
+                    board.translate(m, a.0 - b.0, a.1 - b.1);
+                }
+            }
+        }
+        moved
+    }
+
+    fn origin_of(board: &Board, sel: Sel) -> Option<(f32, f32)> {
+        Some(match sel {
+            Sel::Area(id) => board.area(id).map(|a| (a.x, a.y))?,
+            Sel::Note(id) => board.note(id).map(|n| (n.x, n.y))?,
+            Sel::Text(id) => board.text(id).map(|t| (t.x, t.y))?,
+            Sel::Shape(id) => board.shape(id).map(|s| (s.x1, s.y1))?,
+        })
+    }
+
+    fn apply_move_one(
+        &mut self,
+        board: &mut Board,
+        who: Mover,
+        off: (f32, f32),
+        wx: f32,
+        wy: f32,
+    ) -> bool {
         let (x, y) = (wx - off.0, wy - off.1);
         match who {
             Mover::Area(id) => {
@@ -775,6 +1214,22 @@ impl Editor {
             Mover::Note(id) => {
                 if let Some(n) = board.note_mut(id) {
                     (n.x, n.y) = (x, y);
+                    self.modified = true;
+                    return true;
+                }
+            }
+            Mover::Text(id) => {
+                if let Some(t) = board.text_mut(id) {
+                    (t.x, t.y) = (x, y);
+                    self.modified = true;
+                    return true;
+                }
+            }
+            Mover::Shape { id, orig } => {
+                // `off` is the grab point, so (wx - off) is the pointer's travel.
+                let (dx, dy) = (x, y);
+                if let Some(s) = board.shape_mut(id) {
+                    (s.x1, s.y1, s.x2, s.y2) = (orig.0 + dx, orig.1 + dy, orig.2 + dx, orig.3 + dy);
                     self.modified = true;
                     return true;
                 }
@@ -821,6 +1276,40 @@ impl Editor {
                 }
                 false
             }
+            Drag::Pending {
+                who: Mover::Text(id),
+                ..
+            } => {
+                if board.text(id).is_some() {
+                    self.start_editing_end(board, EditTarget::FreeText(id));
+                    return true;
+                }
+                false
+            }
+            Drag::DrawShape { id } => {
+                if let Some(s) = board.shape_mut(id) {
+                    let (_, _, w, h) = s.bbox();
+                    let tiny = if s.kind == ShapeKind::Line {
+                        w.hypot(h) < 8.0
+                    } else {
+                        w < 8.0 && h < 8.0
+                    };
+                    if tiny {
+                        // A click, not a drag: give it a sensible default size.
+                        s.x2 = s.x1 + DEFAULT_SHAPE.0;
+                        s.y2 = if s.kind == ShapeKind::Line {
+                            s.y1
+                        } else {
+                            s.y1 + DEFAULT_SHAPE.1
+                        };
+                    }
+                    self.selected = Some(Sel::Shape(id));
+                    self.modified = true;
+                }
+                self.tool = Tool::Select;
+                true
+            }
+            Drag::Resize { .. } => true,
             Drag::Draw { id } => {
                 if let Some(s) = board.stroke_mut(id) {
                     s.pts = smooth(&s.pts);
@@ -839,6 +1328,7 @@ impl Editor {
         let ok = self.history.undo(board);
         if ok {
             self.modified = true;
+            self.validate_selection(board);
         }
         ok
     }
@@ -848,6 +1338,7 @@ impl Editor {
         let ok = self.history.redo(board);
         if ok {
             self.modified = true;
+            self.validate_selection(board);
         }
         ok
     }
@@ -1003,6 +1494,9 @@ impl Editor {
             EditTarget::NoteBody(id) if text_of(board, target).is_some_and(str::is_empty) => {
                 self.start_editing_end(board, EditTarget::NoteTitle(id));
             }
+            EditTarget::FreeText(_) if text_of(board, target).is_some_and(str::is_empty) => {
+                self.finish_edit(board); // an empty free text is discarded
+            }
             _ => {}
         }
     }
@@ -1014,7 +1508,7 @@ impl Editor {
                 self.finish_edit(board);
             }
             EditTarget::NoteTitle(id) => self.start_editing(EditTarget::NoteBody(id), 0),
-            EditTarget::NoteBody(_) | EditTarget::TodoBody(..) => {
+            EditTarget::NoteBody(_) | EditTarget::TodoBody(..) | EditTarget::FreeText(_) => {
                 self.text_key(board, edit, Key::Text("\n".into()), _adv);
             }
             EditTarget::TodoText(id, r) => {
@@ -1250,7 +1744,7 @@ pub fn smooth(pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::area_geom;
+    use crate::layout::{self, area_geom, Handle, Sel};
 
     fn adv(_: Style, _: char) -> f32 {
         7.0
@@ -1954,5 +2448,419 @@ mod tests {
         assert!(b.areas[1].todos[3].done);
         assert!(!e.take_modified(), "a refused action changes nothing");
         assert!(!e.undo(&mut b), "and records nothing to undo");
+    }
+
+    // ---- free text
+
+    #[test]
+    fn text_tool_places_free_text_and_it_is_multiline() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        e.set_tool(&mut b, Tool::Text);
+        click(&mut e, &mut b, (300.0, 200.0), 0);
+        assert_eq!(b.texts.len(), 1);
+        assert_eq!((b.texts[0].x, b.texts[0].y), (300.0, 200.0));
+        assert_eq!(e.tool, Tool::Select, "back to Select after placing");
+        assert!(matches!(e.editing.unwrap().target, EditTarget::FreeText(_)));
+        typed(&mut e, &mut b, "hello");
+        e.key(&mut b, Key::Enter, A);
+        typed(&mut e, &mut b, "world");
+        assert_eq!(
+            b.texts[0].text, "hello\nworld",
+            "Enter is a newline in free text"
+        );
+        e.key(&mut b, Key::Escape, A);
+        assert!(e.editing.is_none() && b.texts.len() == 1);
+    }
+
+    #[test]
+    fn empty_free_text_is_discarded() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        e.set_tool(&mut b, Tool::Text);
+        click(&mut e, &mut b, (10.0, 10.0), 0);
+        e.key(&mut b, Key::Escape, A);
+        assert!(b.texts.is_empty());
+        // and Backspace in an empty free text discards it too
+        e.set_tool(&mut b, Tool::Text);
+        click(&mut e, &mut b, (10.0, 10.0), 5000);
+        e.key(&mut b, Key::Backspace, A);
+        assert!(b.texts.is_empty() && e.editing.is_none());
+    }
+
+    #[test]
+    fn text_tool_on_existing_text_edits_it_and_a_click_on_a_card_does_nothing() {
+        let (mut e, mut b) = setup();
+        let id = b.add_text(-3000.0, -3000.0);
+        b.text_mut(id).unwrap().text = "note to self".into();
+        e.set_tool(&mut b, Tool::Text);
+        click(&mut e, &mut b, (-2990.0, -2990.0), 0);
+        assert_eq!(b.texts.len(), 1, "no second text on top of the first");
+        assert_eq!(e.editing.unwrap().target, EditTarget::FreeText(id));
+        assert_eq!(e.editing.unwrap().caret, 12);
+        e.key(&mut b, Key::Escape, A);
+        e.set_tool(&mut b, Tool::Text);
+        let p = centre(work(&b).title);
+        click(&mut e, &mut b, p, 5000);
+        assert_eq!(b.texts.len(), 1);
+        assert_eq!(
+            e.tool,
+            Tool::Text,
+            "clicking a card keeps the Text tool armed"
+        );
+    }
+
+    #[test]
+    fn select_click_edits_free_text_drag_moves_it_and_right_click_removes_it() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        let id = b.add_text(100.0, 100.0);
+        b.text_mut(id).unwrap().text = "move me".into();
+        let mut c = cam();
+        e.press(&mut b, &c, (110.0, 110.0), Button::Left, 0, A);
+        e.motion(&mut b, &mut c, (160.0, 150.0));
+        e.release(&mut b, A);
+        assert_eq!((b.texts[0].x, b.texts[0].y), (150.0, 140.0));
+        assert!(e.editing.is_none(), "a drag does not start editing");
+        assert!(e.undo(&mut b));
+        assert_eq!((b.texts[0].x, b.texts[0].y), (100.0, 100.0));
+        click(&mut e, &mut b, (110.0, 110.0), 9000);
+        assert!(
+            matches!(e.editing.unwrap().target, EditTarget::FreeText(_)),
+            "a click edits"
+        );
+        e.key(&mut b, Key::Escape, A);
+        e.press(&mut b, &cam(), (110.0, 110.0), Button::Right, 20000, A);
+        assert!(b.texts.is_empty());
+    }
+
+    // ---- shapes
+
+    fn draw_shape(e: &mut Editor, b: &mut Board, tool: Tool, from: (f32, f32), to: (f32, f32)) {
+        e.set_tool(b, tool);
+        let mut c = cam();
+        e.press(b, &c, from, Button::Left, 0, A);
+        e.motion(b, &mut c, ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
+        e.motion(b, &mut c, to);
+        e.release(b, A);
+    }
+
+    #[test]
+    fn rectangle_ellipse_and_line_are_dragged_out_and_return_to_select() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        draw_shape(&mut e, &mut b, Tool::Rect, (100.0, 100.0), (300.0, 250.0));
+        draw_shape(
+            &mut e,
+            &mut b,
+            Tool::Ellipse,
+            (400.0, 400.0),
+            (350.0, 320.0),
+        );
+        draw_shape(&mut e, &mut b, Tool::Line, (0.0, 0.0), (80.0, 60.0));
+        let kinds: Vec<ShapeKind> = b.shapes.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            [ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Line]
+        );
+        assert_eq!(b.shapes[0].bbox(), (100.0, 100.0, 200.0, 150.0));
+        assert_eq!(
+            b.shapes[1].bbox(),
+            (350.0, 320.0, 50.0, 80.0),
+            "dragging up-left is normalised"
+        );
+        assert_eq!((b.shapes[2].x2, b.shapes[2].y2), (80.0, 60.0));
+        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(
+            e.selected,
+            Some(Sel::Shape(b.shapes[2].id)),
+            "the new shape is selected"
+        );
+        assert!(
+            e.undo(&mut b) && b.shapes.len() == 2,
+            "one shape is one undo step"
+        );
+    }
+
+    #[test]
+    fn a_click_with_a_shape_tool_makes_a_default_sized_shape() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        e.set_tool(&mut b, Tool::Rect);
+        click(&mut e, &mut b, (500.0, 500.0), 0);
+        assert_eq!(
+            b.shapes[0].bbox(),
+            (500.0, 500.0, DEFAULT_SHAPE.0, DEFAULT_SHAPE.1)
+        );
+        e.set_tool(&mut b, Tool::Line);
+        click(&mut e, &mut b, (0.0, 0.0), 5000);
+        assert_eq!(
+            (b.shapes[1].x2, b.shapes[1].y2),
+            (DEFAULT_SHAPE.0, 0.0),
+            "a default horizontal line"
+        );
+    }
+
+    #[test]
+    fn shapes_move_exactly_and_double_click_cycles_their_colour() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        draw_shape(&mut e, &mut b, Tool::Rect, (100.0, 100.0), (300.0, 250.0));
+        e.deselect();
+        let mut c = cam();
+        e.press(&mut b, &c, (150.0, 150.0), Button::Left, 100_000, A);
+        e.motion(&mut b, &mut c, (170.0, 160.0));
+        e.motion(&mut b, &mut c, (250.0, 190.0));
+        e.release(&mut b, A);
+        assert_eq!(
+            b.shapes[0].bbox(),
+            (200.0, 140.0, 200.0, 150.0),
+            "moved by exactly the pointer travel"
+        );
+        assert!(e.undo(&mut b));
+        assert_eq!(b.shapes[0].bbox(), (100.0, 100.0, 200.0, 150.0));
+        let c0 = b.shapes[0].color;
+        click(&mut e, &mut b, (150.0, 150.0), 200_000);
+        click(&mut e, &mut b, (151.0, 150.0), 200_100);
+        assert_eq!(b.shapes[0].color, (c0 + 1) % crate::board::PALETTE_LEN);
+    }
+
+    #[test]
+    fn cards_stay_clickable_on_top_of_a_shape() {
+        let (mut e, mut b) = setup();
+        let card = work(&b).card;
+        let s = b.add_shape(ShapeKind::Rect, card.x - 50.0, card.y - 50.0);
+        b.shape_mut(s).unwrap().x2 = card.right() + 50.0;
+        b.shape_mut(s).unwrap().y2 = card.bottom() + 50.0;
+        let p = centre(work(&b).rows[0].circle);
+        click(&mut e, &mut b, p, 0);
+        assert!(
+            b.areas[2].todos[0].done,
+            "the checkbox still works on top of a big shape"
+        );
+    }
+
+    // ---- selection and deleting
+
+    #[test]
+    fn clicking_selects_and_clicking_empty_space_deselects() {
+        let (mut e, mut b) = setup();
+        let p = centre(work(&b).title);
+        click(&mut e, &mut b, p, 0);
+        assert_eq!(e.selected, Some(Sel::Area(b.areas[2].id)));
+        click(&mut e, &mut b, (-9000.0, -9000.0), 5000);
+        assert_eq!(e.selected, None);
+        let id = b.add_note(2000.0, 2000.0);
+        b.note_mut(id).unwrap().title = "n".into();
+        let g = note_geom(b.note(id).unwrap(), A);
+        click(&mut e, &mut b, centre(g.body.rect), 9000);
+        assert_eq!(e.selected, Some(Sel::Note(id)));
+        assert!(e.deselect() && e.selected.is_none() && !e.deselect());
+    }
+
+    #[test]
+    fn delete_removes_the_selection_but_never_a_group_that_has_todos() {
+        let (mut e, mut b) = setup();
+        let p = centre(work(&b).title);
+        click(&mut e, &mut b, p, 0);
+        assert!(!e.delete_selected(&mut b), "a group with todos is kept");
+        assert_eq!(b.areas.len(), 7);
+        let s = b.add_shape(ShapeKind::Rect, -500.0, -500.0);
+        b.shape_mut(s).unwrap().x2 = -400.0;
+        b.shape_mut(s).unwrap().y2 = -400.0;
+        e.selected = Some(Sel::Shape(s));
+        assert!(e.delete_selected(&mut b) && b.shapes.is_empty() && e.selected.is_none());
+        assert!(e.undo(&mut b) && b.shapes.len() == 1, "and it is undoable");
+        assert!(
+            !e.delete_selected(&mut b),
+            "nothing selected, nothing deleted"
+        );
+    }
+
+    // ---- resizing
+
+    fn handle_pos(b: &Board, sel: Sel, h: Handle) -> (f32, f32) {
+        layout::handles(b, sel, A)
+            .into_iter()
+            .find(|(k, _)| *k == h)
+            .unwrap()
+            .1
+    }
+
+    fn drag_from(e: &mut Editor, b: &mut Board, from: (f32, f32), to: (f32, f32), t: u32) {
+        let mut c = cam();
+        e.press(b, &c, from, Button::Left, t, A);
+        e.motion(b, &mut c, ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
+        e.motion(b, &mut c, to);
+        e.release(b, A);
+    }
+
+    #[test]
+    fn a_card_is_resized_by_dragging_its_side_handles() {
+        let (mut e, mut b) = setup();
+        let sel = Sel::Area(b.areas[2].id);
+        e.selected = Some(sel);
+        let w0 = b.areas[2].width();
+        let right = handle_pos(&b, sel, Handle::BottomRight);
+        drag_from(&mut e, &mut b, right, (right.0 + 100.0, right.1 + 500.0), 0);
+        assert_eq!(
+            b.areas[2].width(),
+            w0 + 100.0,
+            "wider; height is not touched by the pointer's y"
+        );
+        assert_eq!(b.areas[2].x, 100.0, "left edge fixed");
+        assert!(e.undo(&mut b));
+        assert_eq!(b.areas[2].width(), w0, "one drag is one undo step");
+        // left handle keeps the right edge fixed
+        let right_edge = b.areas[2].x + b.areas[2].width();
+        let tl = handle_pos(&b, sel, Handle::TopLeft);
+        drag_from(&mut e, &mut b, tl, (tl.0 - 60.0, tl.1), 9000);
+        assert_eq!(b.areas[2].width(), w0 + 60.0);
+        assert_eq!(
+            b.areas[2].x + b.areas[2].width(),
+            right_edge,
+            "right edge fixed"
+        );
+    }
+
+    #[test]
+    fn card_and_note_widths_are_clamped() {
+        let (mut e, mut b) = setup();
+        let sel = Sel::Area(b.areas[2].id);
+        e.selected = Some(sel);
+        let br = handle_pos(&b, sel, Handle::BottomRight);
+        drag_from(&mut e, &mut b, br, (br.0 - 5000.0, br.1), 0);
+        assert_eq!(
+            b.areas[2].width(),
+            crate::board::MIN_AREA_W,
+            "never narrower than the minimum"
+        );
+        let br = handle_pos(&b, sel, Handle::BottomRight);
+        drag_from(&mut e, &mut b, br, (br.0 + 9000.0, br.1), 9000);
+        assert_eq!(
+            b.areas[2].width(),
+            crate::board::MAX_W,
+            "never wider than the maximum"
+        );
+        let id = b.add_note(2000.0, 2000.0);
+        let nsel = Sel::Note(id);
+        e.selected = Some(nsel);
+        let nbr = handle_pos(&b, nsel, Handle::BottomRight);
+        drag_from(&mut e, &mut b, nbr, (nbr.0 + 160.0, nbr.1), 30_000);
+        assert_eq!(b.note(id).unwrap().width(), crate::board::NOTE_W + 160.0);
+        let ntl = handle_pos(&b, nsel, Handle::TopLeft);
+        drag_from(&mut e, &mut b, ntl, (ntl.0 + 5000.0, ntl.1), 60_000);
+        assert_eq!(b.note(id).unwrap().width(), crate::board::MIN_NOTE_W);
+    }
+
+    #[test]
+    fn a_handle_on_the_card_wins_over_dragging_the_card() {
+        let (mut e, mut b) = setup();
+        let sel = Sel::Area(b.areas[2].id);
+        e.selected = Some(sel);
+        let tr = handle_pos(&b, sel, Handle::TopRight);
+        let (x0, y0) = (b.areas[2].x, b.areas[2].y);
+        let w0 = b.areas[2].width();
+        drag_from(&mut e, &mut b, tr, (tr.0 + 40.0, tr.1 + 40.0), 0);
+        assert_eq!(
+            (b.areas[2].x, b.areas[2].y),
+            (x0, y0),
+            "the card did not move"
+        );
+        assert_eq!(b.areas[2].width(), w0 + 40.0, "it was resized instead");
+    }
+
+    #[test]
+    fn grabbing_a_handle_only_works_on_the_selected_item() {
+        let (mut e, mut b) = setup();
+        let tr = {
+            let g = work(&b).card;
+            (g.right(), g.y)
+        };
+        let w0 = b.areas[2].width();
+        // nothing selected: pressing near the corner is just a normal click on the canvas/card
+        drag_from(
+            &mut e,
+            &mut b,
+            (tr.0 + 3.0, tr.1 - 3.0),
+            (tr.0 + 80.0, tr.1 - 3.0),
+            0,
+        );
+        assert_eq!(b.areas[2].width(), w0);
+    }
+
+    #[test]
+    fn rectangle_corners_and_line_ends_are_resized() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        draw_shape(&mut e, &mut b, Tool::Rect, (100.0, 100.0), (300.0, 250.0));
+        let sel = e.selected.unwrap();
+        let br = handle_pos(&b, sel, Handle::BottomRight);
+        drag_from(&mut e, &mut b, br, (400.0, 300.0), 0);
+        assert_eq!(b.shapes[0].bbox(), (100.0, 100.0, 300.0, 200.0));
+        let tl = handle_pos(&b, sel, Handle::TopLeft);
+        drag_from(&mut e, &mut b, tl, (50.0, 20.0), 9000);
+        assert_eq!(
+            b.shapes[0].bbox(),
+            (50.0, 20.0, 350.0, 280.0),
+            "opposite corner stayed put"
+        );
+        // dragging a corner past the opposite one flips it cleanly
+        let tl = handle_pos(&b, sel, Handle::TopLeft);
+        drag_from(&mut e, &mut b, tl, (600.0, 500.0), 20_000);
+        let (x, y, w, h) = b.shapes[0].bbox();
+        assert!(
+            w > 0.0 && h > 0.0 && x >= 400.0 - 1e-3 && y >= 300.0 - 1e-3,
+            "{x} {y} {w} {h}"
+        );
+        // a line has two end handles
+        draw_shape(&mut e, &mut b, Tool::Line, (0.0, 0.0), (100.0, 0.0));
+        let lsel = e.selected.unwrap();
+        let hs: Vec<Handle> = layout::handles(&b, lsel, A)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(hs, [Handle::End1, Handle::End2]);
+        let e2 = handle_pos(&b, lsel, Handle::End2);
+        drag_from(&mut e, &mut b, e2, (100.0, 90.0), 50_000);
+        assert_eq!((b.shapes[1].x2, b.shapes[1].y2), (100.0, 90.0));
+        assert_eq!(
+            (b.shapes[1].x1, b.shapes[1].y1),
+            (0.0, 0.0),
+            "the other end is fixed"
+        );
+    }
+
+    #[test]
+    fn free_text_has_no_resize_handles_and_a_removed_item_clears_the_selection() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        let id = b.add_text(0.0, 0.0);
+        b.text_mut(id).unwrap().text = "t".into();
+        assert!(layout::handles(&b, Sel::Text(id), A).is_empty());
+        let s = b.add_shape(ShapeKind::Rect, 500.0, 500.0);
+        b.shape_mut(s).unwrap().x2 = 600.0;
+        b.shape_mut(s).unwrap().y2 = 600.0;
+        click(&mut e, &mut b, (550.0, 550.0), 0);
+        assert_eq!(e.selected, Some(Sel::Shape(s)));
+        e.press(&mut b, &cam(), (550.0, 550.0), Button::Right, 9000, A);
+        assert_eq!(e.selected, None, "removing the selected item deselects it");
+    }
+
+    #[test]
+    fn shift_click_then_ctrl_g_locks_items_so_one_drag_moves_all() {
+        let mut b = Board::new();
+        let n1 = b.add_note(0.0, 0.0);
+        let n2 = b.add_note(600.0, 0.0);
+        b.note_mut(n1).unwrap().title = "a".into();
+        b.note_mut(n2).unwrap().title = "b".into();
+        let mut e = Editor::new();
+        let p1 = centre(crate::layout::note_geom(b.note(n1).unwrap(), A).title);
+        let p2 = centre(crate::layout::note_geom(b.note(n2).unwrap(), A).title);
+        click(&mut e, &mut b, p1, 0);
+        e.shift = true;
+        click(&mut e, &mut b, p2, 1000);
+        e.shift = false;
+        assert_eq!(e.extra.len(), 1);
+        assert!(e.group_selected(&mut b));
+        let mut c = cam();
+        e.press(&mut b, &c, p1, Button::Left, 5000, A);
+        e.motion(&mut b, &mut c, (p1.0 + 100.0, p1.1 + 50.0));
+        e.release(&mut b, A);
+        let (a, d) = (b.note(n1).unwrap(), b.note(n2).unwrap());
+        assert_eq!((a.x, a.y), (100.0, 50.0));
+        assert_eq!((d.x, d.y), (700.0, 50.0));
     }
 }
