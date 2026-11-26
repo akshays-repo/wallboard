@@ -1409,6 +1409,24 @@ impl App {
         } else {
             self.to_key(ev)
         };
+        // Ctrl+B / I / E / Shift+S: Markdown on the word at the caret.
+        if self.mods.ctrl && !pasting {
+            let op = match ev.keysym {
+                Keysym::b | Keysym::B => Some(md::MdOp::Wrap("**")),
+                Keysym::i | Keysym::I => Some(md::MdOp::Wrap("*")),
+                Keysym::e | Keysym::E => Some(md::MdOp::Wrap("`")),
+                Keysym::S if self.mods.shift => Some(md::MdOp::Wrap("~~")),
+                _ => None,
+            };
+            if let Some(op) = op {
+                if let Some(d) = self.detail.as_mut() {
+                    if d.format(op) {
+                        self.request_redraw();
+                    }
+                }
+                return;
+            }
+        }
         let Some(key) = key else { return };
         let Some(d) = self.detail.as_mut() else {
             return;
@@ -1543,25 +1561,28 @@ impl App {
                 | Keysym::U
                 | Keysym::s
                 | Keysym::S
+                | Keysym::e
+                | Keysym::E
                 | Keysym::bracketleft
                 | Keysym::bracketright
-                    if self.editor.text_focus().is_some()
+                    if (self.editor.text_focus().is_some() || self.editor.editing.is_some())
                         && !(matches!(ev.keysym, Keysym::s | Keysym::S) && !self.mods.shift) =>
                 {
-                    let id = self.editor.text_focus().unwrap_or_default();
+                    let focus = self.editor.text_focus();
                     let changed = match ev.keysym {
-                        Keysym::bracketleft | Keysym::bracketright => {
+                        Keysym::bracketleft | Keysym::bracketright => focus.is_some_and(|id| {
                             let up = ev.keysym == Keysym::bracketright;
                             self.editor.step_text_size(&mut self.board, id, up)
-                        }
+                        }),
                         k => {
                             let btn = match k {
                                 Keysym::b | Keysym::B => FmtBtn::Bold,
                                 Keysym::i | Keysym::I => FmtBtn::Italic,
                                 Keysym::u | Keysym::U => FmtBtn::Underline,
+                                Keysym::e | Keysym::E => FmtBtn::Code,
                                 _ => FmtBtn::Strike,
                             };
-                            !repeat && self.editor.format_text(&mut self.board, id, btn)
+                            !repeat && self.editor.apply_fmt(&mut self.board, btn)
                         }
                     };
                     if changed {
@@ -1671,21 +1692,31 @@ impl App {
         if self.detail.is_some() || self.name_box.is_some() {
             return None;
         }
-        let id = self.editor.text_focus()?;
         let f = &self.fonts;
         let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
-        layout::text_bar(&self.board, id, &self.camera, self.view_size(), &adv)
+        if let Some(id) = self.editor.text_focus() {
+            return layout::text_bar(&self.board, id, &self.camera, self.view_size(), &adv);
+        }
+        // Any other field being typed in gets the Markdown buttons.
+        let t = self.editor.editing?.target;
+        let r = editor::field_rect(&self.board, t, &adv)?;
+        let kind = if t.multiline() {
+            layout::BarKind::Block
+        } else {
+            layout::BarKind::Inline
+        };
+        Some(layout::format_bar(kind, r, 0.0, &self.camera, self.view_size()))
     }
 
     /// A left press on the text format bar or grip: `Some(edited)` if it was there.
     fn text_bar_click(&mut self, p: (f32, f32)) -> Option<bool> {
         let bar = self.text_bar()?;
-        if bar.grip.contains(p.0, p.1) {
-            self.editor.grab_text(&self.board, &self.camera, p, bar.id);
+        if let (true, Some(id)) = (bar.on_grip(p.0, p.1), bar.text_id()) {
+            self.editor.grab_text(&self.board, &self.camera, p, id);
             return Some(false);
         }
         if let Some(btn) = bar.btn_at(p.0, p.1) {
-            return Some(self.editor.format_text(&mut self.board, bar.id, btn));
+            return Some(self.editor.apply_fmt(&mut self.board, btn));
         }
         bar.covers(p.0, p.1).then_some(false)
     }
@@ -1748,7 +1779,7 @@ impl App {
     fn update_hover(&mut self, p: (f32, f32)) -> bool {
         let bar = self.text_bar();
         let h = match bar.as_ref() {
-            Some(b) if b.grip.contains(p.0, p.1) => Hover::Grip,
+            Some(b) if b.on_grip(p.0, p.1) => Hover::Grip,
             Some(b) if b.btn_at(p.0, p.1).is_some() => Hover::Fmt(b.btn_at(p.0, p.1).unwrap()),
             _ => self.overlay().hover_at(p.0, p.1, self.theme_open),
         };

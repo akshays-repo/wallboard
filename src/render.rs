@@ -1006,6 +1006,25 @@ fn draw_area(
             }
         } else if t.text.is_empty() {
             // placeholder only while it is the (empty) edited row; nothing otherwise
+        } else if crate::md::has_markup(&t.text, false) {
+            let chars: Vec<char> = t.text.chars().collect();
+            let cs = crate::md::char_styles(&t.text, false);
+            let clip = (clip.0, clip.1.min(v.x(row.text.right() - badge_w)));
+            draw_md_chars(
+                pm,
+                v,
+                fonts,
+                Face::Regular,
+                row_px,
+                v.x(row.text.x),
+                row_cy,
+                &chars,
+                &cs,
+                col,
+                clip,
+                t.done,
+                c,
+            );
         } else {
             let shown = fonts.fit_ellipsis(
                 Face::Regular,
@@ -1077,11 +1096,33 @@ fn draw_area(
             );
         }
         if let Some(body) = &row.body {
-            let chars: Vec<char> = t.body.as_deref().unwrap_or("").chars().collect();
+            let src = t.body.as_deref().unwrap_or("");
+            let chars: Vec<char> = src.chars().collect();
             let body_px = Style::Chip.size() * v.z;
+            let editing_body = editing.is_some_and(|e| e.target == EditTarget::TodoBody(a.id, ri));
+            let md = (!editing_body && crate::md::has_markup(src, true))
+                .then(|| crate::md::char_styles(src, true));
             for (li, line) in body.lines.iter().enumerate() {
                 let s: String = chars[line.start..line.end].iter().collect();
                 let ly = v.y(body.rect.y + (li as f32 + 0.5) * BODY_LINE_H);
+                if let Some(cs) = &md {
+                    draw_md_chars(
+                        pm,
+                        v,
+                        fonts,
+                        Face::Regular,
+                        body_px,
+                        v.x(body.rect.x),
+                        ly,
+                        &chars[line.start..line.end],
+                        &cs[line.start..line.end],
+                        c.secondary,
+                        (v.x(body.rect.x), v.x(body.rect.right())),
+                        false,
+                        c,
+                    );
+                    continue;
+                }
                 text_px(
                     pm,
                     v,
@@ -1096,7 +1137,6 @@ fn draw_area(
                     false,
                 );
             }
-            let editing_body = editing.is_some_and(|e| e.target == EditTarget::TodoBody(a.id, ri));
             if editing_body {
                 let e = editing.unwrap();
                 draw_text_sel(
@@ -1282,6 +1322,24 @@ fn draw_note(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, n: &Note, scene: &
             clip_t,
             false,
         );
+    } else if crate::md::has_markup(&n.title, false) {
+        let chars: Vec<char> = n.title.chars().collect();
+        let cs = crate::md::char_styles(&n.title, false);
+        draw_md_chars(
+            pm,
+            v,
+            fonts,
+            Face::Bold,
+            tpx,
+            v.x(g.title.x),
+            t_cy,
+            &chars,
+            &cs,
+            c.text,
+            clip_t,
+            false,
+            c,
+        );
     } else {
         let shown = fonts.fit_ellipsis(Face::Bold, &n.title, Style::Title.size(), g.title.w);
         text_px(
@@ -1329,9 +1387,29 @@ fn draw_note(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, n: &Note, scene: &
             false,
         );
     }
+    let md = (!editing_body && crate::md::has_markup(&n.body, true))
+        .then(|| crate::md::char_styles(&n.body, true));
     for (li, line) in g.body.lines.iter().enumerate() {
         let s: String = chars[line.start..line.end].iter().collect();
         let cy = v.y(g.body.rect.y + (li as f32 + 0.5) * NOTE_LINE_H);
+        if let Some(cs) = &md {
+            draw_md_chars(
+                pm,
+                v,
+                fonts,
+                Face::Regular,
+                bpx,
+                v.x(g.body.rect.x),
+                cy,
+                &chars[line.start..line.end],
+                &cs[line.start..line.end],
+                c.text,
+                clip_b,
+                false,
+                c,
+            );
+            continue;
+        }
         text_px(
             pm,
             v,
@@ -1585,7 +1663,24 @@ fn draw_run(
     color: Rgb,
     (italic, underline, strike): (bool, bool, bool),
 ) -> f32 {
-    let clip = (0.0, v.w as f32);
+    draw_run_clip(pm, v, fonts, face, size_px, x, cy, s, color, (italic, underline, strike), (0.0, v.w as f32))
+}
+
+/// `draw_run` limited to the horizontal range `clip` (buffer px).
+#[allow(clippy::too_many_arguments)]
+fn draw_run_clip(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    face: Face,
+    size_px: f32,
+    x: f32,
+    cy: f32,
+    s: &str,
+    color: Rgb,
+    (italic, underline, strike): (bool, bool, bool),
+    clip: (f32, f32),
+) -> f32 {
     if s.is_empty() {
         return 0.0;
     }
@@ -1599,11 +1694,11 @@ fn draw_run(
     let baseline = cy + (asc - desc) / 2.0;
     let qpx = quantize_px(size_px);
     let (wi, hi) = (v.w as i32, v.h as i32);
-    let clip_i = (0, wi);
+    let clip_i = (clip.0.floor() as i32, clip.1.ceil() as i32);
     let mut pen = x;
     for ch in s.chars() {
         let adv = fonts.advance(face, ch, size_px);
-        if ch != ' ' && pen + adv + size_px * 0.3 >= 0.0 && pen <= v.w as f32 {
+        if ch != ' ' && pen + adv + size_px * 0.3 >= clip.0 && pen <= clip.1 {
             let g = fonts.glyph(face, ch, qpx);
             let gx = (pen + g.xmin as f32).round() as i32;
             let gy = (baseline - (g.ymin + g.h as i32) as f32).round() as i32;
@@ -1612,8 +1707,129 @@ fn draw_run(
         }
         pen += adv;
     }
-    decorate(pm, v, x, width, cy, size_px, color, fonts, face, underline, strike);
+    let (x0, x1) = (x.max(clip.0), (x + width).min(clip.1));
+    if x1 > x0 {
+        decorate(pm, v, x0, x1 - x0, cy, size_px, color, fonts, face, underline, strike);
+    }
     width
+}
+
+/// Draw chars of a field with Markdown rendered in place (`cs` from `md::char_styles`, one per
+/// char): markers hidden, list / task / quote / rule symbols drawn where their prefix was.
+/// `strike_all` strikes everything (a done todo). Returns the width drawn.
+#[allow(clippy::too_many_arguments)]
+fn draw_md_chars(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    base: Face,
+    px: f32,
+    x: f32,
+    cy: f32,
+    chars: &[char],
+    cs: &[crate::md::Cs],
+    color: Rgb,
+    clip: (f32, f32),
+    strike_all: bool,
+    c: &Colors,
+) -> f32 {
+    let tf = Transform::identity();
+    let n = chars.len().min(cs.len());
+    let mut pen = x;
+    let mut i = 0;
+    while i < n {
+        let st = cs[i];
+        if let Some(b) = st.prefix {
+            match b {
+                Block::Bullet => {
+                    if let Some(p) = PathBuilder::from_circle(pen + px * 0.3, cy, px * 0.14) {
+                        pm.fill_path(&p, &paint(color, 0xff, true), FillRule::Winding, tf, None);
+                    }
+                    pen += px * 0.9;
+                }
+                Block::Task(done) => {
+                    let sz = px * 0.8;
+                    let (bx, by) = (pen, cy - sz / 2.0);
+                    if let Some(p) = rounded_rect(bx, by, sz, sz, sz * 0.25) {
+                        if done {
+                            pm.fill_path(&p, &paint(c.accent[0], 0xff, true), FillRule::Winding, tf, None);
+                            let mut pb = PathBuilder::new();
+                            pb.move_to(bx + sz * 0.24, by + sz * 0.52);
+                            pb.line_to(bx + sz * 0.43, by + sz * 0.7);
+                            pb.line_to(bx + sz * 0.77, by + sz * 0.3);
+                            if let Some(ck) = pb.finish() {
+                                let sk = SkStroke {
+                                    width: (sz * 0.13).max(1.0),
+                                    line_cap: LineCap::Round,
+                                    line_join: LineJoin::Round,
+                                    ..SkStroke::default()
+                                };
+                                pm.stroke_path(&ck, &paint(WHITE, 0xff, true), &sk, tf, None);
+                            }
+                        } else {
+                            let sk = SkStroke {
+                                width: (px * 0.08).max(1.0),
+                                ..SkStroke::default()
+                            };
+                            pm.stroke_path(&p, &paint(c.secondary, 0xff, true), &sk, tf, None);
+                        }
+                    }
+                    pen += px * 1.2;
+                }
+                Block::Quote => {
+                    let r = Rect::from_xywh(pen + px * 0.05, cy - px * 0.7, (px * 0.14).max(1.5), px * 1.4);
+                    if let Some(r) = r {
+                        pm.fill_rect(r, &paint(c.accent[0], 0xff, false), tf, None);
+                    }
+                    pen += px * 0.6;
+                }
+                Block::Rule => {
+                    if let Some(r) = Rect::from_xywh(clip.0, cy, clip.1 - clip.0, v.hair()) {
+                        pm.fill_rect(r, &paint(c.sep, 0xff, false), tf, None);
+                    }
+                    return clip.1 - x;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if st.hidden {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && !cs[j].hidden && cs[j].prefix.is_none() && cs[j].same_run(&st) {
+            j += 1;
+        }
+        let run: String = chars[i..j].iter().filter(|ch| **ch != '\n').collect();
+        let face = if base == Face::Bold || st.bold || st.heading > 0 {
+            Face::Bold
+        } else {
+            base
+        };
+        let col = if st.done {
+            c.tertiary
+        } else if st.dim || st.quote {
+            c.secondary
+        } else if st.code {
+            c.accent[3]
+        } else {
+            color
+        };
+        if st.code {
+            let w = fonts.text_width(face, &run, px);
+            let pad = px * 0.2;
+            if let Some(p) = rounded_rect(pen - pad, cy - px * 0.7, w + 2.0 * pad, px * 1.4, px * 0.25) {
+                let a = if c.dark { 60 } else { 30 };
+                pm.fill_path(&p, &paint(c.secondary, a, true), FillRule::Winding, tf, None);
+            }
+        }
+        let deco = (st.italic || st.quote, false, st.strike || st.done || strike_all);
+        pen += draw_run_clip(pm, v, fonts, face, px, pen, cy, &run, col, deco, clip);
+        i = j;
+    }
+    pen - x
 }
 
 /// Underline and strike-through lines under / through a run.
@@ -1834,18 +2050,40 @@ fn draw_markdown(
     }
 }
 
+/// A list icon (three rows of bullet + line, or checkbox + line) centred on (cx, cy).
+fn draw_list_icon(pm: &mut PixmapMut, v: &View, task: bool, cx: f32, cy: f32, color: Rgb) {
+    let u = v.scale;
+    let tf = Transform::identity();
+    for row in 0..3 {
+        let y = cy + (row as f32 - 1.0) * 5.5 * u;
+        let x0 = cx - 7.0 * u;
+        if task {
+            if let Some(p) = rounded_rect(x0 - 1.8 * u, y - 1.8 * u, 3.6 * u, 3.6 * u, 0.8 * u) {
+                let st = SkStroke {
+                    width: 1.1 * u,
+                    ..SkStroke::default()
+                };
+                pm.stroke_path(&p, &paint(color, 0xff, true), &st, tf, None);
+            }
+        } else if let Some(p) = PathBuilder::from_circle(x0, y, 1.5 * u) {
+            pm.fill_path(&p, &paint(color, 0xff, true), FillRule::Winding, tf, None);
+        }
+        if let Some(r) = Rect::from_xywh(x0 + 4.0 * u, y - 0.75 * u, 10.0 * u, 1.5 * u) {
+            pm.fill_rect(r, &paint(color, 0xff, false), tf, None);
+        }
+    }
+}
+
 /// The floating format bar and the drag grip of the focused text box (screen space).
 fn draw_text_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, c: &Colors) {
     let Some(bar) = scene.text_bar else {
         return;
     };
-    let Some(t) = scene.board.text(bar.id) else {
-        return;
-    };
+    let t = bar.text_id().and_then(|id| scene.board.text(id));
     let s = v.scale;
     let tf = Transform::identity();
     // Grip: a small card with two columns of dots.
-    let g = bar.grip;
+    if let Some(g) = bar.grip {
     let grip_hot = scene.hover == Hover::Grip;
     if let Some(p) = rounded_rect(g.x * s, g.y * s, g.w * s, g.h * s, 6.0 * s) {
         let fill = if grip_hot { c.hover } else { c.card };
@@ -1866,6 +2104,7 @@ fn draw_text_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene,
             }
         }
     }
+    }
 
     pill(pm, v, bar.bar, c);
     for x in &bar.seps {
@@ -1880,7 +2119,7 @@ fn draw_text_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene,
         let hot = scene.hover == Hover::Fmt(*btn);
         if let FmtBtn::Color(k) = btn {
             let fill = if *k == 0 { c.text } else { c.accent[*k as usize % 10] };
-            let ring = if t.color == *k {
+            let ring = if t.is_some_and(|t| t.color == *k) {
                 c.accent[0]
             } else if hot {
                 c.secondary
@@ -1890,15 +2129,15 @@ fn draw_text_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene,
             draw_swatch(pm, v, cx, cy, fill, ring);
             continue;
         }
-        let active = match btn {
+        let active = t.is_some_and(|t| match btn {
             FmtBtn::Bold => t.bold,
             FmtBtn::Italic => t.italic,
             FmtBtn::Underline => t.underline,
             FmtBtn::Strike => t.strike,
             FmtBtn::Size(sz) => t.size == *sz,
             FmtBtn::Markdown => !t.plain,
-            FmtBtn::Color(_) => false,
-        };
+            _ => false,
+        });
         if active || hot {
             if let Some(p) = rounded_rect(x, y, w, h, 8.0 * s) {
                 let fill = if active { c.accent[0] } else { c.hover };
@@ -1927,6 +2166,12 @@ fn draw_text_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene,
                 ("A", Face::Bold, px, (false, false, false))
             }
             FmtBtn::Markdown => ("MD", Face::Bold, 11.0, (false, false, false)),
+            FmtBtn::Code => ("<>", Face::Bold, 12.0, (false, false, false)),
+            FmtBtn::Heading => ("H", Face::Bold, 15.0, (false, false, false)),
+            FmtBtn::Bullet | FmtBtn::Task => {
+                draw_list_icon(pm, v, *btn == FmtBtn::Task, cx, cy, ink);
+                continue;
+            }
             FmtBtn::Color(_) => continue,
         };
         let px = px * s;
@@ -2414,8 +2659,8 @@ const HELP_LEFT: [(&str, &str); 22] = [
     ("B", "Cycle background / wallpaper"),
     ("W", "Wallpaper rotation"),
     ("F / Shift+F", "Wallpaper folder: pick / open"),
-    ("Ctrl+B / I / U", "Text: bold / italic / underline"),
-    ("Ctrl+Shift+S", "Text: strike-through"),
+    ("Ctrl+B / I / U", "Bold / italic / underline"),
+    ("Ctrl+Shift+S / Ctrl+E", "Strike-through / code"),
     ("Ctrl+[ / ]", "Text: smaller / bigger"),
     ("?", "This help"),
 ];
@@ -2689,12 +2934,22 @@ fn draw_detail(
                     false,
                 );
             }
+            let md = (!active && crate::md::has_markup(text, true))
+                .then(|| crate::md::char_styles(text, true));
             for (i, ln) in lines.iter().enumerate().skip(first).take(rows_fit) {
                 let t: String = chars[ln.start..ln.end]
                     .iter()
                     .filter(|c| **c != '\n')
                     .collect();
                 let ly = (y + 6.0 + (i - first) as f32 * line_h + line_h / 2.0) * s;
+                if let Some(cs) = &md {
+                    let (a0, b0) = (ln.start, ln.end.min(cs.len()));
+                    draw_md_chars(
+                        pm, v, fonts, Face::Regular, size, clip.0, ly, &chars[a0..b0], &cs[a0..b0],
+                        c.text, clip, false, c,
+                    );
+                    continue;
+                }
                 text_px(
                     pm,
                     v,
@@ -2737,6 +2992,12 @@ fn draw_detail(
                     c.tertiary,
                     clip,
                     false,
+                );
+            } else if !active && field == Field::Title && crate::md::has_markup(text, false) {
+                let cs = crate::md::char_styles(text, false);
+                draw_md_chars(
+                    pm, v, fonts, Face::Regular, size, clip.0, cy_mid, &chars, &cs, c.text, clip,
+                    false, c,
                 );
             } else {
                 text_px(
@@ -3996,9 +4257,23 @@ mod dump_text {
             t.text = "small struck text".into();
             (t.size, t.strike) = (TextSize::Small, true);
         }
+        let note = board.add_note(110.0, 560.0);
+        {
+            let n = board.note_mut(note).unwrap();
+            n.title = "Sticky *styled*".into();
+            n.body = "## Today\n- [x] **ship** it\n- [ ] write `tests`\n> stay ~~busy~~ calm".into();
+        }
+        let area = board.add_area(520.0, 420.0);
+        board.area_mut(area).unwrap().todos = vec![
+            crate::board::Todo::new("Call **mom** about *dinner*"),
+            crate::board::Todo {
+                body: Some("- bring **cake**\n- `7pm`".into()),
+                ..crate::board::Todo::new("Plain todo")
+            },
+        ];
         let mut editor = Editor::new();
         editor.selected = Some(Sel::Text(st));
-        let (w, h) = (1400u32, 800u32);
+        let (w, h) = (1400u32, 1000u32);
         let cam = Camera { x: 0.0, y: -40.0, zoom: 1.0 };
         for theme in [Theme::Dark, Theme::Light] {
             let ff: &Fonts = &f;

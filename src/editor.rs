@@ -88,7 +88,7 @@ impl EditTarget {
             EditTarget::TodoBody(_, r) => 4 + 2 * r,
         }
     }
-    fn multiline(self) -> bool {
+    pub fn multiline(self) -> bool {
         matches!(
             self,
             EditTarget::TodoBody(..) | EditTarget::NoteBody(_) | EditTarget::FreeText(_)
@@ -255,6 +255,20 @@ pub fn style_of(board: &Board, t: EditTarget) -> Style {
             .text(id)
             .map_or(Style::Free(Default::default(), false), |t| t.style()),
     }
+}
+
+/// Where a field is on the board (world units).
+pub fn field_rect(board: &Board, t: EditTarget, adv: Adv) -> Option<crate::layout::Rect> {
+    Some(match t {
+        EditTarget::AreaTitle(id) => area_geom(board.area(id)?, adv).title,
+        EditTarget::TodoText(id, r) => area_geom(board.area(id)?, adv).rows.get(r)?.text,
+        EditTarget::TodoBody(id, r) => {
+            area_geom(board.area(id)?, adv).rows.get(r)?.body.as_ref()?.rect
+        }
+        EditTarget::NoteTitle(id) => note_geom(board.note(id)?, adv).title,
+        EditTarget::NoteBody(id) => note_geom(board.note(id)?, adv).body.rect,
+        EditTarget::FreeText(id) => text_geom(board.text(id)?, adv).rect,
+    })
 }
 
 /// The wrapped lines of a multi-line field (`None` for single-line fields).
@@ -1358,6 +1372,7 @@ impl Editor {
             FmtBtn::Size(sz) => t.size = sz,
             FmtBtn::Color(c) => t.color = c % crate::board::PALETTE_LEN,
             FmtBtn::Markdown => t.plain = !t.plain,
+            FmtBtn::Code | FmtBtn::Heading | FmtBtn::Bullet | FmtBtn::Task => return false,
         }
         if t == cur {
             return false;
@@ -1368,6 +1383,65 @@ impl Editor {
         }
         self.modified = true;
         true
+    }
+
+    /// Apply a Markdown edit to the field being typed in (its selection, else the word or line
+    /// at the caret), or to the whole of a selected text box. One undo step; true if it changed.
+    pub fn format_md(&mut self, board: &mut Board, op: crate::md::MdOp) -> bool {
+        let (target, sel, caret) = match self.editing {
+            Some(e) => (e.target, self.selection(), e.caret),
+            None => {
+                let Some(id) = self.text_focus() else {
+                    return false;
+                };
+                let len = board.text(id).map_or(0, |t| t.text.chars().count());
+                (EditTarget::FreeText(id), Some((0, len)), len)
+            }
+        };
+        let Some(text) = text_of(board, target) else {
+            return false;
+        };
+        let Some((t, nsel, ncaret)) =
+            crate::md::apply(text, sel, caret, op, target.multiline())
+        else {
+            return false;
+        };
+        self.history.record(board, None);
+        if let Some(dst) = text_mut(board, target) {
+            *dst = t;
+        }
+        self.modified = true;
+        if self.editing.is_some() {
+            self.anchor = nsel.map(|(a, _)| a);
+            self.set_caret(ncaret);
+        }
+        true
+    }
+
+    /// A format bar button or shortcut. Bold / italic / strike on a free text box style the whole
+    /// box unless text in it is selected; everywhere else (and for code, headings and lists) they
+    /// edit Markdown markers around the selection or the word / line at the caret.
+    pub fn apply_fmt(&mut self, board: &mut Board, btn: FmtBtn) -> bool {
+        use crate::md::{LineKind, MdOp};
+        let op = match btn {
+            FmtBtn::Bold => Some(MdOp::Wrap("**")),
+            FmtBtn::Italic => Some(MdOp::Wrap("*")),
+            FmtBtn::Strike => Some(MdOp::Wrap("~~")),
+            FmtBtn::Code => Some(MdOp::Wrap("`")),
+            FmtBtn::Heading => Some(MdOp::Line(LineKind::Heading)),
+            FmtBtn::Bullet => Some(MdOp::Line(LineKind::Bullet)),
+            FmtBtn::Task => Some(MdOp::Line(LineKind::Task)),
+            _ => None,
+        };
+        let free = self.text_focus();
+        let whole_box = matches!(btn, FmtBtn::Bold | FmtBtn::Italic | FmtBtn::Strike)
+            && free.is_some()
+            && self.selection().is_none();
+        match (op, free) {
+            (Some(op), _) if !whole_box => self.format_md(board, op),
+            (_, Some(id)) => self.format_text(board, id, btn),
+            _ => false,
+        }
     }
 
     /// Step the size of text `id` up or down (Ctrl+] / Ctrl+[).
@@ -3192,6 +3266,50 @@ mod tests {
         assert!(e.step_text_size(&mut b, id, false));
         assert_eq!(b.text(id).unwrap().size, crate::board::TextSize::Heading);
         assert!(e.take_modified());
+    }
+
+    #[test]
+    fn selected_text_in_notes_and_todos_gets_markdown_styles() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        let n = b.add_note(0.0, 0.0);
+        b.note_mut(n).unwrap().body = "buy milk today".into();
+        e.editing = Some(Edit {
+            target: EditTarget::NoteBody(n),
+            caret: 8,
+        });
+        e.anchor = Some(4);
+        assert!(e.apply_fmt(&mut b, FmtBtn::Bold));
+        assert_eq!(b.note(n).unwrap().body, "buy **milk** today");
+        assert_eq!(e.selection(), Some((6, 10)), "the word stays selected");
+        assert!(e.apply_fmt(&mut b, FmtBtn::Bold), "again: unbold");
+        assert_eq!(b.note(n).unwrap().body, "buy milk today");
+        assert!(e.apply_fmt(&mut b, FmtBtn::Task));
+        assert_eq!(b.note(n).unwrap().body, "- [ ] buy milk today");
+        assert!(e.undo(&mut b));
+        assert_eq!(b.note(n).unwrap().body, "buy milk today");
+        // A single-line todo takes inline styles on the word at the caret, not line formats.
+        let a = b.add_area(0.0, 400.0);
+        b.area_mut(a).unwrap().todos = vec![Todo::new("call mom")];
+        e.anchor = None;
+        e.editing = Some(Edit {
+            target: EditTarget::TodoText(a, 0),
+            caret: 6,
+        });
+        assert!(e.apply_fmt(&mut b, FmtBtn::Italic));
+        assert_eq!(b.area(a).unwrap().todos[0].text, "call *mom*");
+        assert!(!e.apply_fmt(&mut b, FmtBtn::Bullet));
+        // A free text box: bold with nothing selected styles the box; with a selection, the words.
+        let t = b.add_text(500.0, 0.0);
+        b.text_mut(t).unwrap().text = "one two".into();
+        e.editing = Some(Edit {
+            target: EditTarget::FreeText(t),
+            caret: 7,
+        });
+        assert!(e.apply_fmt(&mut b, FmtBtn::Bold));
+        assert!(b.text(t).unwrap().bold && b.text(t).unwrap().text == "one two");
+        e.anchor = Some(4);
+        assert!(e.apply_fmt(&mut b, FmtBtn::Strike));
+        assert_eq!(b.text(t).unwrap().text, "one ~~two~~");
     }
 
     #[test]

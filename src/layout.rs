@@ -415,13 +415,19 @@ pub fn text_geom(t: &TextBox, adv: Adv) -> TextGeom {
     }
 }
 
-/// A button on the floating format bar of a text box.
+/// A button on the floating format bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FmtBtn {
     Bold,
     Italic,
     Underline,
     Strike,
+    /// Inline `code`.
+    Code,
+    /// Cycle `#`, `##`, `###`, none on the line.
+    Heading,
+    Bullet,
+    Task,
     Size(TextSize),
     /// 0 = theme text colour, else an accent index.
     Color(u8),
@@ -432,24 +438,45 @@ pub enum FmtBtn {
 /// Text colours offered on the format bar (0 = theme text colour).
 pub const TEXT_COLORS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
-/// The format bar and drag grip of the focused text box, in screen (logical) px.
+/// What the format bar is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarKind {
+    /// A free text box: every button, plus the drag grip.
+    Text(u64),
+    /// A multi-line field (note body, todo details): inline and line formats.
+    Block,
+    /// A single-line field (todo, titles): inline formats.
+    Inline,
+}
+
+/// The format bar (and, for free text, its drag grip), in screen (logical) px.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextBar {
-    pub id: u64,
+    pub kind: BarKind,
     pub bar: Rect,
     pub btns: Vec<(FmtBtn, Rect)>,
     /// Separators between button groups (x positions).
     pub seps: Vec<f32>,
-    /// The handle left of the text: drag it to move the text, even while typing.
-    pub grip: Rect,
+    /// The handle left of a free text: drag it to move the text, even while typing.
+    pub grip: Option<Rect>,
 }
 
 impl TextBar {
     pub fn btn_at(&self, x: f32, y: f32) -> Option<FmtBtn> {
         self.btns.iter().find(|(_, r)| r.contains(x, y)).map(|(b, _)| *b)
     }
+    pub fn on_grip(&self, x: f32, y: f32) -> bool {
+        self.grip.is_some_and(|g| g.contains(x, y))
+    }
     pub fn covers(&self, x: f32, y: f32) -> bool {
-        self.bar.contains(x, y) || self.grip.contains(x, y)
+        self.bar.contains(x, y) || self.on_grip(x, y)
+    }
+    /// The free text this bar belongs to.
+    pub fn text_id(&self) -> Option<u64> {
+        match self.kind {
+            BarKind::Text(id) => Some(id),
+            _ => None,
+        }
     }
 }
 
@@ -458,53 +485,52 @@ const BAR_SWATCH: f32 = 22.0;
 const BAR_PAD: f32 = 5.0;
 const BAR_SEP: f32 = 9.0;
 
-/// Where the format bar and grip of text `id` go, given the camera and view size.
-pub fn text_bar(
-    board: &Board,
-    id: u64,
+/// The format bar for a field at world rectangle `r`, placed above it (below if no room).
+pub fn format_bar(
+    kind: BarKind,
+    r: Rect,
+    first_line_h: f32,
     cam: &crate::camera::Camera,
     (vw, vh): (f32, f32),
-    adv: Adv,
-) -> Option<TextBar> {
-    let t = board.text(id)?;
-    let r = text_geom(t, adv).rect;
+) -> TextBar {
+    use FmtBtn::*;
     let (sx, sy) = cam.world_to_screen(r.x, r.y);
     let sh = r.h * cam.zoom;
+    let inline = vec![Bold, Italic, Strike, Code];
+    let lines = vec![Heading, Bullet, Task];
+    let groups: Vec<Vec<FmtBtn>> = match kind {
+        BarKind::Text(_) => vec![
+            vec![Bold, Italic, Underline, Strike],
+            vec![Code, Heading, Bullet, Task],
+            TextSize::ALL.map(Size).to_vec(),
+            TEXT_COLORS.map(Color).to_vec(),
+            vec![Markdown],
+        ],
+        BarKind::Block => vec![inline, lines],
+        BarKind::Inline => vec![inline],
+    };
     let mut btns = Vec::new();
     let mut seps = Vec::new();
     let mut x = BAR_PAD;
-    let group = |list: &[FmtBtn], bw: f32, x: &mut f32, btns: &mut Vec<_>| {
-        for b in list {
-            btns.push((*b, Rect::new(*x, BAR_PAD, bw, BAR_BTN)));
-            *x += bw + 2.0;
+    for (gi, list) in groups.iter().enumerate() {
+        if gi > 0 {
+            seps.push(x + BAR_SEP / 2.0 - 1.0);
+            x += BAR_SEP;
         }
-    };
-    group(
-        &[FmtBtn::Bold, FmtBtn::Italic, FmtBtn::Underline, FmtBtn::Strike],
-        BAR_BTN,
-        &mut x,
-        &mut btns,
-    );
-    for list in [
-        TextSize::ALL.map(FmtBtn::Size).to_vec(),
-        TEXT_COLORS.map(FmtBtn::Color).to_vec(),
-        vec![FmtBtn::Markdown],
-    ] {
-        seps.push(x + BAR_SEP / 2.0 - 1.0);
-        x += BAR_SEP;
-        let bw = if matches!(list[0], FmtBtn::Color(_)) {
-            BAR_SWATCH
-        } else if list[0] == FmtBtn::Markdown {
-            BAR_BTN + 10.0
-        } else {
-            BAR_BTN
+        let bw = match list[0] {
+            Color(_) => BAR_SWATCH,
+            Markdown => BAR_BTN + 10.0,
+            _ => BAR_BTN,
         };
-        group(&list, bw, &mut x, &mut btns);
+        for b in list {
+            btns.push((*b, Rect::new(x, BAR_PAD, bw, BAR_BTN)));
+            x += bw + 2.0;
+        }
     }
     let bw = x - 2.0 + BAR_PAD;
     let bh = BAR_BTN + 2.0 * BAR_PAD;
     let bx = sx.clamp(8.0, (vw - bw - 8.0).max(8.0));
-    // Above the text if there is room (clear of the top menu), else below it.
+    // Above the field if there is room (clear of the top menu), else below it.
     let above = sy - 12.0 - bh;
     let by = if above >= 64.0 || sy + sh + 12.0 + bh > vh {
         above.max(8.0)
@@ -516,16 +542,32 @@ pub fn text_bar(
         b.y += by;
     }
     let seps = seps.into_iter().map(|s| s + bx).collect();
-    let first = t.line_h().max(t.size.px()) * cam.zoom;
-    let gh = 26.0_f32.max(first.min(40.0));
-    let grip = Rect::new(sx - 26.0, sy + (first - gh) / 2.0, 20.0, gh);
-    Some(TextBar {
-        id,
+    let grip = matches!(kind, BarKind::Text(_)).then(|| {
+        let first = first_line_h * cam.zoom;
+        let gh = 26.0_f32.max(first.min(40.0));
+        Rect::new(sx - 26.0, sy + (first - gh) / 2.0, 20.0, gh)
+    });
+    TextBar {
+        kind,
         bar: Rect::new(bx, by, bw, bh),
         btns,
         seps,
         grip,
-    })
+    }
+}
+
+/// The format bar and grip of free text `id`.
+pub fn text_bar(
+    board: &Board,
+    id: u64,
+    cam: &crate::camera::Camera,
+    view: (f32, f32),
+    adv: Adv,
+) -> Option<TextBar> {
+    let t = board.text(id)?;
+    let r = text_geom(t, adv).rect;
+    let first = t.line_h().max(t.size.px());
+    Some(format_bar(BarKind::Text(id), r, first, cam, view))
 }
 
 /// True if a world point is on a shape (inside a rectangle/ellipse, near a line).

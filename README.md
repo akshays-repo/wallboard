@@ -97,6 +97,14 @@ into it, and a **format bar** appears above it:
 The style applies to the whole box. To move a text box, drag the **grip** (the dots to its left).
 This works while you are typing too. A plain drag on a box you are not editing also moves it.
 
+**Styling any text (notes, todos, details):** while typing in a sticky note, a todo or a todo's
+details, the format bar shows **B / I / S / `<>`** (and, in multi-line fields, heading, bullet
+and checkbox). Select words and press a button, or `Ctrl+B` / `Ctrl+I` / `Ctrl+Shift+S` /
+`Ctrl+E` (code). With nothing selected they apply to the word under the caret. Press again to
+remove the style. Styles are stored as Markdown markers in the text (`**bold**`), shown raw
+while you type and rendered once you click away. On the todo detail page use the shortcuts.
+In a free text box with nothing selected, B / I / S style the whole box.
+
 **Copy and paste:** with a text box selected (not typing), `Ctrl+C` copies it and `Ctrl+V`
 pastes a copy, with its style, under the pointer. `Ctrl+X` cuts it and `Ctrl+D` duplicates it.
 The text also goes to the system clipboard. Text copied in another app and pasted with

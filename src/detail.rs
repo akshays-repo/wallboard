@@ -141,6 +141,21 @@ impl Detail {
         Outcome::Keep
     }
 
+    /// Apply a Markdown edit to the active field at the caret (not the due date).
+    pub fn format(&mut self, op: crate::md::MdOp) -> bool {
+        if self.field == Field::Due {
+            return false;
+        }
+        let multi = self.field == Field::Desc;
+        let caret = self.caret;
+        let Some((t, _, c)) = crate::md::apply(self.text(self.field), None, caret, op, multi) else {
+            return false;
+        };
+        *self.active_mut() = t;
+        self.caret = c;
+        true
+    }
+
     fn save_or_keep(&self) -> Outcome {
         if self.can_save() {
             Outcome::Save
