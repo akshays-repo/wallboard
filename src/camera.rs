@@ -32,7 +32,6 @@ impl Camera {
             && (MIN_ZOOM..=MAX_ZOOM).contains(&self.zoom)
     }
 
-    #[cfg(test)]
     pub fn world_to_screen(&self, wx: f32, wy: f32) -> (f32, f32) {
         ((wx - self.x) * self.zoom, (wy - self.y) * self.zoom)
     }

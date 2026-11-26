@@ -29,6 +29,9 @@ pub struct Todo {
     /// Optional multi-line details under the title. `None` = collapsed, `Some` = shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Optional due date as `YYYY-MM-DD` (validated by `crate::detail::parse_date`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
 }
 
 impl Todo {
@@ -38,6 +41,7 @@ impl Todo {
             done: false,
             priority: 0,
             body: None,
+            due: None,
         }
     }
 }
@@ -78,19 +82,106 @@ fn is_zero(g: &u64) -> bool {
 
 pub const NOTE_W: f32 = 240.0;
 
-/// Free text on the canvas: no card, just text you can type anywhere.
+/// A saved view of the canvas: a named spot you can jump back to from the top menu.
+/// It stores no content, only where to look (the world point at the centre of the screen and
+/// the zoom).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Space {
+    pub id: u64,
+    pub name: String,
+    pub x: f32,
+    pub y: f32,
+    #[serde(default = "one")]
+    pub zoom: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_medium(s: &TextSize) -> bool {
+    *s == TextSize::Medium
+}
+
+/// Size of a free text box: small, medium (the default), heading, title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextSize {
+    Small,
+    #[default]
+    Medium,
+    Heading,
+    Title,
+}
+
+impl TextSize {
+    pub const ALL: [TextSize; 4] = [
+        TextSize::Small,
+        TextSize::Medium,
+        TextSize::Heading,
+        TextSize::Title,
+    ];
+    /// Font size in world units.
+    pub fn px(self) -> f32 {
+        match self {
+            TextSize::Small => 15.0,
+            TextSize::Medium => 20.0,
+            TextSize::Heading => 30.0,
+            TextSize::Title => 44.0,
+        }
+    }
+    /// One step bigger (`up`) or smaller, stopping at the ends.
+    pub fn step(self, up: bool) -> TextSize {
+        let i = TextSize::ALL.iter().position(|s| *s == self).unwrap_or(1);
+        let j = if up { (i + 1).min(3) } else { i.saturating_sub(1) };
+        TextSize::ALL[j]
+    }
+}
+
+/// Free text on the canvas: no card, just text you can type anywhere. The whole box shares one
+/// style (size, bold, italic, underline, strike, colour); when not being edited its text is
+/// rendered as Markdown unless `plain`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TextBox {
     pub id: u64,
     pub x: f32,
     pub y: f32,
     #[serde(default)]
     pub text: String,
+    /// 0 = the theme's text colour, else an index into the accent palette.
     #[serde(default)]
     pub color: u8,
     /// Lock-together group id (0 = ungrouped). Moving one member moves them all.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub group: u64,
+    #[serde(default, skip_serializing_if = "is_medium")]
+    pub size: TextSize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strike: bool,
+    /// Show the raw text instead of rendering Markdown.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plain: bool,
+}
+
+impl TextBox {
+    /// The style the raw text is measured and drawn in.
+    pub fn style(&self) -> crate::text::Style {
+        crate::text::Style::Free(self.size, self.bold)
+    }
+    /// Height of one raw line, world units.
+    pub fn line_h(&self) -> f32 {
+        self.size.px() * 1.4
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,13 +369,53 @@ pub enum Theme {
     #[default]
     Dark,
     Light,
+    Aurora,
+    Neon,
+    Blueprint,
+    Paper,
+    Brutal,
 }
 
 impl Theme {
+    pub const ALL: [Theme; 7] = [
+        Theme::Dark,
+        Theme::Light,
+        Theme::Aurora,
+        Theme::Neon,
+        Theme::Blueprint,
+        Theme::Paper,
+        Theme::Brutal,
+    ];
+
+    /// The `L` key: classic dark <-> light (any other theme goes back to dark).
     pub fn toggled(self) -> Theme {
         match self {
             Theme::Dark => Theme::Light,
-            Theme::Light => Theme::Dark,
+            _ => Theme::Dark,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+            Theme::Aurora => "Aurora",
+            Theme::Neon => "Neon",
+            Theme::Blueprint => "Blueprint",
+            Theme::Paper => "Paper",
+            Theme::Brutal => "Brutal",
+        }
+    }
+
+    pub fn tagline(self) -> &'static str {
+        match self {
+            Theme::Dark => "Apple night",
+            Theme::Light => "Apple day",
+            Theme::Aurora => "Glowing northern sky",
+            Theme::Neon => "Cyber glow edges",
+            Theme::Blueprint => "Technical drawing",
+            Theme::Paper => "Warm and calm",
+            Theme::Brutal => "Bold, flat, loud",
         }
     }
 }
@@ -441,6 +572,8 @@ pub struct Board {
     pub texts: Vec<TextBox>,
     pub shapes: Vec<Shape>,
     pub connectors: Vec<Connector>,
+    /// Saved views shown in the top menu.
+    pub spaces: Vec<Space>,
     next_id: u64,
 }
 
@@ -453,11 +586,57 @@ impl Board {
             texts: Vec::new(),
             shapes: Vec::new(),
             connectors: Vec::new(),
+            spaces: Vec::new(),
             next_id: 1,
         }
     }
 
     /// Attach loaded connectors, repairing bad values and ids.
+    /// Attach loaded spaces, repairing bad ids, positions and zoom.
+    pub fn with_spaces(mut self, mut spaces: Vec<Space>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        for sp in &mut spaces {
+            if !sp.x.is_finite() || !sp.y.is_finite() {
+                (sp.x, sp.y) = (0.0, 0.0);
+            }
+            sp.zoom = if sp.zoom.is_finite() {
+                sp.zoom
+                    .clamp(crate::camera::MIN_ZOOM, crate::camera::MAX_ZOOM)
+            } else {
+                1.0
+            };
+            if sp.id == 0 || !seen.insert(sp.id) {
+                sp.id = self.take_id();
+                seen.insert(sp.id);
+            } else {
+                self.next_id = self.next_id.max(sp.id.saturating_add(1));
+            }
+        }
+        self.spaces = spaces;
+        self
+    }
+
+    /// Save a view as a space. Returns its id.
+    pub fn add_space(&mut self, name: &str, x: f32, y: f32, zoom: f32) -> u64 {
+        let id = self.take_id();
+        self.spaces.push(Space {
+            id,
+            name: name.to_string(),
+            x,
+            y,
+            zoom,
+        });
+        id
+    }
+
+    pub fn space(&self, id: u64) -> Option<&Space> {
+        self.spaces.iter().find(|s| s.id == id)
+    }
+
+    pub fn space_mut(&mut self, id: u64) -> Option<&mut Space> {
+        self.spaces.iter_mut().find(|s| s.id == id)
+    }
+
     pub fn with_connectors(mut self, mut cs: Vec<Connector>) -> Self {
         let mut seen = std::collections::HashSet::new();
         for c in &mut cs {
@@ -643,6 +822,7 @@ impl Board {
             texts,
             shapes,
             connectors: Vec::new(),
+            spaces: Vec::new(),
             next_id: next,
         }
     }
@@ -848,9 +1028,20 @@ impl Board {
             id,
             x,
             y,
-            text: String::new(),
-            color: 0,
+            ..TextBox::default()
+        });
+        id
+    }
+
+    /// A copy of `tmpl` (text and style) as a new text box at (x, y).
+    pub fn add_text_like(&mut self, tmpl: &TextBox, x: f32, y: f32) -> u64 {
+        let id = self.take_id();
+        self.texts.push(TextBox {
+            id,
+            x,
+            y,
             group: 0,
+            ..tmpl.clone()
         });
         id
     }
@@ -968,6 +1159,7 @@ struct Snap {
     texts: Vec<TextBox>,
     shapes: Vec<Shape>,
     connectors: Vec<Connector>,
+    spaces: Vec<Space>,
 }
 
 impl Snap {
@@ -979,6 +1171,7 @@ impl Snap {
             texts: b.texts.clone(),
             shapes: b.shapes.clone(),
             connectors: b.connectors.clone(),
+            spaces: b.spaces.clone(),
         }
     }
     /// Swap this snapshot with the board's current content.
@@ -989,6 +1182,7 @@ impl Snap {
         std::mem::swap(&mut self.texts, &mut b.texts);
         std::mem::swap(&mut self.shapes, &mut b.shapes);
         std::mem::swap(&mut self.connectors, &mut b.connectors);
+        std::mem::swap(&mut self.spaces, &mut b.spaces);
     }
 }
 
@@ -1059,6 +1253,7 @@ mod tests {
                 done: true,
                 priority: 0,
                 body: None,
+                due: None,
             });
         }
         a
@@ -1195,6 +1390,7 @@ mod tests {
                 done: false,
                 priority: prio,
                 body: None,
+                due: None,
             }],
             group: 0,
         };
@@ -1282,6 +1478,45 @@ mod tests {
         let back: Note =
             serde_json::from_str(&serde_json::to_string(&b.notes[0]).unwrap()).unwrap();
         assert_eq!(back, b.notes[0]);
+    }
+
+    #[test]
+    fn spaces_are_added_repaired_and_undoable() {
+        let mut b = Board::new();
+        let id = b.add_space("Docs", 10.0, 20.0, 2.0);
+        assert_eq!(b.space(id).unwrap().name, "Docs");
+        let mut h = History::new();
+        h.record(&b, None);
+        b.spaces.clear();
+        assert!(
+            h.undo(&mut b) && b.spaces.len() == 1,
+            "undo restores the space"
+        );
+        let bad = vec![
+            Space {
+                id: 5,
+                name: "a".into(),
+                x: f32::NAN,
+                y: 1.0,
+                zoom: 99.0,
+            },
+            Space {
+                id: 5,
+                name: "dup".into(),
+                x: 0.0,
+                y: 0.0,
+                zoom: f32::NAN,
+            },
+        ];
+        let b = Board::new().with_spaces(bad);
+        assert_eq!(
+            (b.spaces[0].x, b.spaces[0].zoom),
+            (0.0, crate::camera::MAX_ZOOM)
+        );
+        assert_ne!(b.spaces[0].id, b.spaces[1].id, "duplicate ids are fixed");
+        assert_eq!(b.spaces[1].zoom, 1.0);
+        let mut b = b;
+        assert!(![b.spaces[0].id, b.spaces[1].id].contains(&b.add_space("n", 0.0, 0.0, 1.0)));
     }
 
     #[test]
@@ -1389,7 +1624,10 @@ mod tests {
         b.cycle(&imgs);
         assert_eq!(b.image.as_deref(), Some("/w/b.png"));
         b.cycle(&imgs);
-        assert!(!b.image_on && b.color.is_none(), "last wallpaper -> default");
+        assert!(
+            !b.image_on && b.color.is_none(),
+            "last wallpaper -> default"
+        );
     }
 
     #[test]
@@ -1412,7 +1650,10 @@ mod tests {
             assert!(b.advance(&three, rnd));
             assert_ne!(b.image, before, "random pick differs from the current one");
         }
-        assert!(!b.advance(&three[..1], 0), "one wallpaper: nothing to rotate to");
+        assert!(
+            !b.advance(&three[..1], 0),
+            "one wallpaper: nothing to rotate to"
+        );
     }
 
     #[test]
@@ -1492,7 +1733,7 @@ mod tests {
             y: 1.0,
             text: String::new(),
             color: 77,
-            group: 0,
+            ..TextBox::default()
         };
         let sp = |id| Shape {
             src: String::new(),

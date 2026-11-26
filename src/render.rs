@@ -10,19 +10,23 @@ use crate::board::{
 use crate::camera::Camera;
 use crate::editor::{lines_of, scroll_x, style_of, EditTarget, Editor};
 use crate::layout::{
-    area_geom, connector_path, handles, note_geom, radius, text_geom, AreaGeom, Overlay,
+    area_geom, connector_path, handles, note_geom, radius, text_geom, AreaGeom, Hover, Overlay,
     Rect as LRect, Sel, Tool, ViewBtn, BODY_LINE_H, CIRCLE, NOTE_LINE_H, NOTE_RADIUS, NOTE_TITLE_H,
-    PAD, ROW_H, TEXT_GAP, TEXT_LINE_H,
+    PAD, ROW_H, TEXT_GAP,
 };
-use crate::text::{blit, line_of, quantize_px, Face, Fonts, Style, MIN_GLYPH_PX};
+use crate::layout::{FmtBtn, TextBar};
+use crate::md::Block;
+use crate::text::{blit, blit_slanted, line_of, quantize_px, Face, Fonts, Style, MIN_GLYPH_PX};
 use tiny_skia::{
     Color, FillRule, FilterQuality, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapMut,
     PixmapPaint, Rect, Stroke as SkStroke, StrokeDash, Transform,
 };
+use tiny_skia::{GradientStop, Point, RadialGradient, SpreadMode};
 
 type Rgb = (u8, u8, u8);
 
 /// A theme's colours. Dark and light follow the Apple system palettes.
+#[derive(Clone, Copy)]
 pub struct Colors {
     pub canvas: Rgb,
     pub card: Rgb,
@@ -34,6 +38,31 @@ pub struct Colors {
     /// The ten area colours: blue, green, orange, red, yellow, teal, purple, pink, indigo, gray.
     pub accent: [Rgb; 10],
     pub dark: bool,
+    /// How cards cast shadows (a theme's material).
+    pub shadow: Shadow,
+    /// Card outline colour override (else the separator colour).
+    pub edge: Option<Rgb>,
+    /// Multipliers on the card outline width and corner radius.
+    pub border_scale: f32,
+    pub radius_scale: f32,
+    pub grid: Grid,
+    /// Three soft light colours drawn as an aurora behind everything.
+    pub aurora: Option<[Rgb; 3]>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Shadow {
+    Soft,
+    Hard,
+    Glow,
+    Flat,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Grid {
+    Dots,
+    Lines,
+    None,
 }
 
 pub fn colors(theme: Theme) -> Colors {
@@ -59,6 +88,12 @@ pub fn colors(theme: Theme) -> Colors {
                 (0x98, 0x98, 0x9d),
             ],
             dark: true,
+            shadow: Shadow::Soft,
+            edge: None,
+            border_scale: 1.0,
+            radius_scale: 1.0,
+            grid: Grid::Dots,
+            aurora: None,
         },
         Theme::Light => Colors {
             canvas: (0xf2, 0xf2, 0xf7),
@@ -81,7 +116,165 @@ pub fn colors(theme: Theme) -> Colors {
                 (0x8e, 0x8e, 0x93),
             ],
             dark: false,
+            shadow: Shadow::Soft,
+            edge: None,
+            border_scale: 1.0,
+            radius_scale: 1.0,
+            grid: Grid::Dots,
+            aurora: None,
         },
+        Theme::Aurora => Colors {
+            canvas: (0x0a, 0x0e, 0x1f),
+            card: (0x13, 0x19, 0x2e),
+            hover: (0x1f, 0x28, 0x46),
+            sep: (0x2b, 0x35, 0x5c),
+            text: (0xf4, 0xf6, 0xff),
+            secondary: (0xa6, 0xb2, 0xd6),
+            tertiary: (0x66, 0x72, 0x9a),
+            shadow: Shadow::Glow,
+            edge: Some((0x3a, 0x48, 0x7a)),
+            radius_scale: 1.25,
+            grid: Grid::None,
+            aurora: Some([(0x2d, 0x5b, 0xff), (0x9b, 0x3d, 0xff), (0x00, 0xd4, 0xb4)]),
+            ..colors(Theme::Dark)
+        },
+        Theme::Neon => Colors {
+            canvas: (0x07, 0x06, 0x0d),
+            card: (0x0e, 0x0c, 0x1a),
+            hover: (0x1c, 0x17, 0x33),
+            sep: (0x2a, 0x22, 0x4d),
+            text: (0xf2, 0xf0, 0xff),
+            secondary: (0x9a, 0x94, 0xc8),
+            tertiary: (0x5c, 0x56, 0x88),
+            accent: [
+                (0x00, 0xe5, 0xff),
+                (0x39, 0xff, 0x14),
+                (0xff, 0x9e, 0x00),
+                (0xff, 0x2d, 0x55),
+                (0xff, 0xee, 0x00),
+                (0x00, 0xff, 0xc8),
+                (0xb3, 0x4d, 0xff),
+                (0xff, 0x2d, 0xd1),
+                (0x6a, 0x6a, 0xff),
+                (0x9a, 0x9a, 0xb8),
+            ],
+            shadow: Shadow::Glow,
+            edge: Some((0x00, 0xe5, 0xff)),
+            border_scale: 1.3,
+            radius_scale: 0.7,
+            grid: Grid::Dots,
+            ..colors(Theme::Dark)
+        },
+        Theme::Blueprint => Colors {
+            canvas: (0x0d, 0x2b, 0x55),
+            card: (0x12, 0x35, 0x66),
+            hover: (0x1b, 0x47, 0x82),
+            sep: (0x4f, 0x86, 0xc6),
+            text: (0xe8, 0xf4, 0xff),
+            secondary: (0x9d, 0xc4, 0xea),
+            tertiary: (0x6a, 0x93, 0xc2),
+            accent: [
+                (0x7d, 0xd3, 0xfc),
+                (0x86, 0xef, 0xac),
+                (0xfd, 0xba, 0x74),
+                (0xfc, 0xa5, 0xa5),
+                (0xfd, 0xe0, 0x47),
+                (0x5e, 0xea, 0xd4),
+                (0xc4, 0xb5, 0xfd),
+                (0xf9, 0xa8, 0xd4),
+                (0xa5, 0xb4, 0xfc),
+                (0xcb, 0xd5, 0xe1),
+            ],
+            shadow: Shadow::Flat,
+            border_scale: 1.2,
+            radius_scale: 0.35,
+            grid: Grid::Lines,
+            ..colors(Theme::Dark)
+        },
+        Theme::Paper => Colors {
+            canvas: (0xf4, 0xee, 0xe0),
+            card: (0xfd, 0xfa, 0xf2),
+            hover: (0xee, 0xe6, 0xd2),
+            sep: (0xdd, 0xd3, 0xbb),
+            text: (0x2b, 0x25, 0x1c),
+            secondary: (0x7a, 0x6f, 0x5c),
+            tertiary: (0xb3, 0xa8, 0x92),
+            accent: [
+                (0x3b, 0x6e, 0xa8),
+                (0x5a, 0x8f, 0x4e),
+                (0xd0, 0x80, 0x2a),
+                (0xc2, 0x4a, 0x3a),
+                (0xd4, 0xa8, 0x1c),
+                (0x3d, 0x8f, 0x8f),
+                (0x8a, 0x5a, 0xa8),
+                (0xc2, 0x55, 0x7a),
+                (0x56, 0x5a, 0xa8),
+                (0x8a, 0x82, 0x72),
+            ],
+            dark: false,
+            radius_scale: 0.6,
+            ..colors(Theme::Light)
+        },
+        Theme::Brutal => Colors {
+            canvas: (0xff, 0xe6, 0x6d),
+            card: (0xff, 0xff, 0xff),
+            hover: (0xff, 0xf1, 0xb0),
+            sep: (0x00, 0x00, 0x00),
+            text: (0x00, 0x00, 0x00),
+            secondary: (0x2e, 0x2e, 0x2e),
+            tertiary: (0x77, 0x77, 0x77),
+            accent: [
+                (0x2f, 0x6b, 0xff),
+                (0x00, 0xc8, 0x6e),
+                (0xff, 0x7a, 0x00),
+                (0xff, 0x3b, 0x3b),
+                (0xff, 0xd6, 0x00),
+                (0x00, 0xc2, 0xd1),
+                (0x9b, 0x4d, 0xff),
+                (0xff, 0x4d, 0xa6),
+                (0x4a, 0x4a, 0xff),
+                (0x66, 0x66, 0x66),
+            ],
+            dark: false,
+            shadow: Shadow::Hard,
+            edge: Some((0, 0, 0)),
+            border_scale: 2.2,
+            radius_scale: 0.35,
+            grid: Grid::None,
+            aurora: None,
+        },
+    }
+}
+
+/// Blend two themes for the switch animation: colours and metrics glide, while the discrete
+/// material (shadow style, grid, aurora) flips at the halfway point.
+pub fn lerp_colors(a: &Colors, b: &Colors, t: f32) -> Colors {
+    let t = t.clamp(0.0, 1.0);
+    let late = if t < 0.5 { a } else { b };
+    let f = |x: f32, y: f32| x + (y - x) * t;
+    let mut accent = a.accent;
+    for (i, c) in accent.iter_mut().enumerate() {
+        *c = mix(a.accent[i], b.accent[i], t);
+    }
+    Colors {
+        canvas: mix(a.canvas, b.canvas, t),
+        card: mix(a.card, b.card, t),
+        hover: mix(a.hover, b.hover, t),
+        sep: mix(a.sep, b.sep, t),
+        text: mix(a.text, b.text, t),
+        secondary: mix(a.secondary, b.secondary, t),
+        tertiary: mix(a.tertiary, b.tertiary, t),
+        accent,
+        dark: late.dark,
+        shadow: late.shadow,
+        edge: match (a.edge, b.edge) {
+            (Some(x), Some(y)) => Some(mix(x, y, t)),
+            _ => late.edge,
+        },
+        border_scale: f(a.border_scale, b.border_scale),
+        radius_scale: f(a.radius_scale, b.radius_scale),
+        grid: late.grid,
+        aurora: late.aurora,
     }
 }
 
@@ -168,6 +361,8 @@ pub struct Scene<'a> {
     pub board: &'a Board,
     pub editor: &'a Editor,
     pub theme: Theme,
+    /// The colours to draw with: a blend while the theme is animating (else `colors(theme)`).
+    pub palette: Option<Colors>,
     pub background: &'a Background,
     /// Pre-scaled, pre-dimmed wallpaper in buffer byte order (see `build_wallpaper`).
     pub wallpaper: Option<&'a [u8]>,
@@ -175,6 +370,16 @@ pub struct Scene<'a> {
     pub current_area: Option<usize>,
     /// Draw the keyboard shortcuts popup.
     pub show_help: bool,
+    /// The todo detail page, when open.
+    pub detail: Option<&'a crate::detail::Detail>,
+    /// The popup naming a space, when open.
+    pub name_box: Option<&'a crate::detail::NameBox>,
+    /// The theme panel is open.
+    pub theme_open: bool,
+    /// What the pointer is over in the overlay.
+    pub hover: Hover,
+    /// The format bar and grip of the focused text box.
+    pub text_bar: Option<&'a TextBar>,
 }
 
 /// Draw the whole frame. `canvas` is `w * h * 4` bytes, `scale` the integer buffer scale.
@@ -187,7 +392,7 @@ pub fn draw(
     scene: &Scene,
     fonts: &mut Fonts,
 ) {
-    let c = colors(scene.theme);
+    let c = scene.palette.unwrap_or_else(|| colors(scene.theme));
     let v = View {
         cam: *cam,
         z: cam.zoom * scale as f32,
@@ -207,7 +412,10 @@ pub fn draw(
             };
             let (r, g, b) = bgr(bg);
             pm.fill(Color::from_rgba8(r, g, b, 0xff));
-            draw_grid(&mut pm, &v, bg);
+            if let Some(cols) = c.aurora {
+                draw_aurora(&mut pm, &v, cols);
+            }
+            draw_grid(&mut pm, &v, bg, c.grid);
         }
     }
     let Some(mut pm) = PixmapMut::from_bytes(canvas, w, h) else {
@@ -236,10 +444,53 @@ pub fn draw(
         draw_stroke(&mut pm, &v, s, &c);
     }
     draw_selection(&mut pm, &v, fonts, scene, &c);
+    draw_marquee(&mut pm, &v, scene, &c);
+    draw_text_bar(&mut pm, &v, fonts, scene, &c);
     draw_overlay(&mut pm, &v, fonts, scene, &c);
 }
 
-fn draw_grid(pm: &mut PixmapMut, v: &View, bg: Rgb) {
+/// Three big soft radial lights, drifting a little against the pan for depth. Drawn once per
+/// frame into the existing buffer; no extra memory.
+fn draw_aurora(pm: &mut PixmapMut, v: &View, cols: [Rgb; 3]) {
+    let (w, h) = (v.w as f32, v.h as f32);
+    let spots = [
+        (0.18_f32, 0.15_f32, 0.55_f32),
+        (0.85, 0.30, 0.50),
+        (0.45, 0.95, 0.60),
+    ];
+    for (i, (fx, fy, fr)) in spots.iter().enumerate() {
+        let drift = 0.04 * v.z * (1.0 + i as f32 * 0.5);
+        let (cx, cy) = (fx * w - v.cam.x * drift, fy * h - v.cam.y * drift);
+        let r = fr * w.max(h);
+        let (cr, cg, cb) = bgr(cols[i]);
+        let stops = vec![
+            GradientStop::new(0.0, Color::from_rgba8(cr, cg, cb, 90)),
+            GradientStop::new(1.0, Color::from_rgba8(cr, cg, cb, 0)),
+        ];
+        let Some(shader) = RadialGradient::new(
+            Point::from_xy(cx, cy),
+            0.0,
+            Point::from_xy(cx, cy),
+            r,
+            stops,
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) else {
+            continue;
+        };
+        let mut p = Paint::default();
+        p.shader = shader;
+        p.anti_alias = false;
+        if let Some(rect) = Rect::from_xywh(0.0, 0.0, w, h) {
+            pm.fill_rect(rect, &p, Transform::identity(), None);
+        }
+    }
+}
+
+fn draw_grid(pm: &mut PixmapMut, v: &View, bg: Rgb, kind: Grid) {
+    if kind == Grid::None {
+        return;
+    }
     let (cam, z) = (&v.cam, v.z);
     let toward = if luminance(bg) < 128.0 {
         WHITE
@@ -265,6 +516,22 @@ fn draw_grid(pm: &mut PixmapMut, v: &View, bg: Rgb) {
     };
     let (minor, major) = (paint(minor_c, 0xff, false), paint(major_c, 0xff, false));
     let tf = Transform::identity();
+    if kind == Grid::Lines {
+        let th = v.hair();
+        for j in j0..=j1 {
+            let p = if j % 4 == 0 { &major } else { &minor };
+            if let Some(r) = Rect::from_xywh(0.0, v.y(j as f32 * step), v.w as f32, th) {
+                pm.fill_rect(r, p, tf, None);
+            }
+        }
+        for i in i0..=i1 {
+            let p = if i % 4 == 0 { &major } else { &minor };
+            if let Some(r) = Rect::from_xywh(v.x(i as f32 * step), 0.0, th, v.h as f32) {
+                pm.fill_rect(r, p, tf, None);
+            }
+        }
+        return;
+    }
     for j in j0..=j1 {
         let sy = v.y(j as f32 * step);
         for i in i0..=i1 {
@@ -343,13 +610,40 @@ fn text_px(
 
 fn card_shadow(pm: &mut PixmapMut, v: &View, x: f32, y: f32, w: f32, h: f32, r: f32, c: &Colors) {
     let tf = Transform::identity();
-    // Two hard-edged layers (no blur): a tight contact shadow and a wider, fainter one.
-    let (a1, a2) = if c.dark { (60, 34) } else { (26, 14) };
-    if let Some(p) = rounded_rect(x + 3.0 * v.z, y + 10.0 * v.z, w - 6.0 * v.z, h, r) {
-        pm.fill_path(&p, &paint((0, 0, 0), a2, true), FillRule::Winding, tf, None);
-    }
-    if let Some(p) = rounded_rect(x, y + 1.5 * v.z, w, h, r) {
-        pm.fill_path(&p, &paint((0, 0, 0), a1, true), FillRule::Winding, tf, None);
+    match c.shadow {
+        Shadow::Flat => {}
+        Shadow::Hard => {
+            // A solid offset block, no blur.
+            if let Some(p) = rounded_rect(x + 5.0 * v.z, y + 5.0 * v.z, w, h, r) {
+                pm.fill_path(
+                    &p,
+                    &paint((0, 0, 0), 0xff, true),
+                    FillRule::Winding,
+                    tf,
+                    None,
+                );
+            }
+        }
+        Shadow::Glow => {
+            // Stacked translucent halos in the edge colour, widest first.
+            let col = c.edge.unwrap_or(c.accent[0]);
+            for (grow, a) in [(12.0, 10u8), (7.0, 16), (3.0, 28)] {
+                let g = grow * v.z;
+                if let Some(p) = rounded_rect(x - g, y - g, w + 2.0 * g, h + 2.0 * g, r + g) {
+                    pm.fill_path(&p, &paint(col, a, true), FillRule::Winding, tf, None);
+                }
+            }
+        }
+        Shadow::Soft => {
+            // Two hard-edged layers (no blur): a tight contact shadow and a wider, fainter one.
+            let (a1, a2) = if c.dark { (60, 34) } else { (26, 14) };
+            if let Some(p) = rounded_rect(x + 3.0 * v.z, y + 10.0 * v.z, w - 6.0 * v.z, h, r) {
+                pm.fill_path(&p, &paint((0, 0, 0), a2, true), FillRule::Winding, tf, None);
+            }
+            if let Some(p) = rounded_rect(x, y + 1.5 * v.z, w, h, r) {
+                pm.fill_path(&p, &paint((0, 0, 0), a1, true), FillRule::Winding, tf, None);
+            }
+        }
     }
 }
 
@@ -364,6 +658,12 @@ fn draw_card(
     c: &Colors,
 ) {
     let (x, y, w, h) = v.rect(rect);
+    let r = r * c.radius_scale;
+    let border_w = border_w * c.border_scale;
+    let border = match c.edge {
+        Some(e) if border == c.sep => e,
+        _ => border,
+    };
     card_shadow(pm, v, x, y, w, h, r * v.z, c);
     if let Some(p) = rounded_rect(x, y, w, h, r * v.z) {
         pm.fill_path(
@@ -632,6 +932,7 @@ fn draw_area(
     // Rows.
     let row_px = Style::Row.size() * v.z;
     let prio_orange = c.accent[2];
+    let today = crate::detail::today();
     for (ri, (t, row)) in a.todos.iter().zip(&g.rows).enumerate() {
         let edit_here = editing.is_some_and(|e| matches!(e.target, EditTarget::TodoText(id, r) | EditTarget::TodoBody(id, r) if id == a.id && r == ri));
         if edit_here {
@@ -652,6 +953,12 @@ fn draw_area(
             }
         }
         draw_check_circle(pm, v, row.circle, accent, t.done, c);
+        let due_badge = t.due.as_deref().and_then(|d| {
+            crate::detail::badge(d, today).map(|b| (b, crate::detail::overdue(d, today)))
+        });
+        let badge_w = due_badge.as_ref().map_or(0.0, |(b, _)| {
+            fonts.text_width(Face::Regular, b, Style::Chip.size()) + 10.0
+        });
         let row_cy = v.y(row.rect.y + ROW_H / 2.0);
         let clip = (v.x(row.text.x), v.x(row.text.right()));
         let col = if t.done { c.tertiary } else { c.text };
@@ -700,7 +1007,12 @@ fn draw_area(
         } else if t.text.is_empty() {
             // placeholder only while it is the (empty) edited row; nothing otherwise
         } else {
-            let shown = fonts.fit_ellipsis(Face::Regular, &t.text, Style::Row.size(), row.text.w);
+            let shown = fonts.fit_ellipsis(
+                Face::Regular,
+                &t.text,
+                Style::Row.size(),
+                row.text.w - badge_w,
+            );
             text_px(
                 pm,
                 v,
@@ -728,6 +1040,38 @@ fn draw_area(
                 row_cy,
                 &marks,
                 prio_orange,
+                (0.0, v.w as f32),
+                false,
+            );
+        }
+        if let Some((label, late)) = &due_badge {
+            let mut right = row.prio.right() - PAD;
+            if t.priority > 0 {
+                let mw = fonts.text_width(
+                    Face::Bold,
+                    &"!".repeat(t.priority as usize),
+                    Style::Row.size(),
+                );
+                right -= mw + 8.0;
+            }
+            let bw = fonts.text_width(Face::Regular, label, Style::Chip.size());
+            let col = if t.done {
+                c.tertiary
+            } else if *late {
+                c.accent[3]
+            } else {
+                c.secondary
+            };
+            text_px(
+                pm,
+                v,
+                fonts,
+                Face::Regular,
+                Style::Chip.size() * v.z,
+                v.x(right - bw),
+                row_cy,
+                label,
+                col,
                 (0.0, v.w as f32),
                 false,
             );
@@ -1226,6 +1570,92 @@ fn draw_connector(pm: &mut PixmapMut, v: &View, path: &[(f32, f32)], color: u8, 
     }
 }
 
+/// One run of text with optional synthetic italic, underline and strike-through (buffer px).
+/// Returns its width.
+#[allow(clippy::too_many_arguments)]
+fn draw_run(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    face: Face,
+    size_px: f32,
+    x: f32,
+    cy: f32,
+    s: &str,
+    color: Rgb,
+    (italic, underline, strike): (bool, bool, bool),
+) -> f32 {
+    let clip = (0.0, v.w as f32);
+    if s.is_empty() {
+        return 0.0;
+    }
+    if size_px < MIN_GLYPH_PX || !italic {
+        let w = text_px(pm, v, fonts, face, size_px, x, cy, s, color, clip, false);
+        decorate(pm, v, x, w, cy, size_px, color, fonts, face, underline, strike);
+        return w;
+    }
+    let width = fonts.text_width(face, s, size_px);
+    let (asc, desc) = fonts.ascent_descent(face, size_px);
+    let baseline = cy + (asc - desc) / 2.0;
+    let qpx = quantize_px(size_px);
+    let (wi, hi) = (v.w as i32, v.h as i32);
+    let clip_i = (0, wi);
+    let mut pen = x;
+    for ch in s.chars() {
+        let adv = fonts.advance(face, ch, size_px);
+        if ch != ' ' && pen + adv + size_px * 0.3 >= 0.0 && pen <= v.w as f32 {
+            let g = fonts.glyph(face, ch, qpx);
+            let gx = (pen + g.xmin as f32).round() as i32;
+            let gy = (baseline - (g.ymin + g.h as i32) as f32).round() as i32;
+            let slant = (0.2, baseline.round() as i32);
+            blit_slanted(pm.data_mut(), wi, hi, g, gx, gy, color, clip_i, slant);
+        }
+        pen += adv;
+    }
+    decorate(pm, v, x, width, cy, size_px, color, fonts, face, underline, strike);
+    width
+}
+
+/// Underline and strike-through lines under / through a run.
+#[allow(clippy::too_many_arguments)]
+fn decorate(
+    pm: &mut PixmapMut,
+    v: &View,
+    x: f32,
+    w: f32,
+    cy: f32,
+    size_px: f32,
+    color: Rgb,
+    fonts: &Fonts,
+    face: Face,
+    underline: bool,
+    strike: bool,
+) {
+    let th = (size_px * 0.065).max(1.0);
+    let (asc, desc) = fonts.ascent_descent(face, size_px);
+    let baseline = cy + (asc - desc) / 2.0;
+    let mut line = |y: f32| {
+        if let Some(r) = Rect::from_xywh(x, y, w, th) {
+            pm.fill_rect(r, &paint(color, 0xff, false), Transform::identity(), None);
+        }
+    };
+    if underline {
+        line(baseline + size_px * 0.1);
+    }
+    if strike {
+        line(baseline - asc * 0.32 - th / 2.0);
+    }
+    let _ = v;
+}
+
+fn text_color(t: &TextBox, c: &Colors) -> Rgb {
+    if t.color == 0 {
+        c.text
+    } else {
+        c.accent[t.color as usize % 10]
+    }
+}
+
 fn draw_free_text(
     pm: &mut PixmapMut,
     v: &View,
@@ -1242,69 +1672,291 @@ fn draw_free_text(
     if !v.visible(x, y, w, h) {
         return;
     }
-    let chars: Vec<char> = t.text.chars().collect();
-    let px = Style::Free.size() * v.z;
-    let clip = (0.0, v.w as f32);
-    for (li, line) in g.lines.iter().enumerate() {
-        let s: String = chars[line.start..line.end].iter().collect();
-        let cy = v.y(g.rect.y + (li as f32 + 0.5) * TEXT_LINE_H);
-        text_px(
-            pm,
-            v,
-            fonts,
-            Face::Regular,
-            px,
-            x,
-            cy,
-            &s,
-            c.text,
-            clip,
-            false,
-        );
+    let col = text_color(t, c);
+    let editing = scene
+        .editor
+        .editing
+        .is_some_and(|e| e.target == EditTarget::FreeText(t.id));
+    if editing || t.plain {
+        // Raw text: what you type is what you see.
+        let st = t.style();
+        let chars: Vec<char> = t.text.chars().collect();
+        let px = st.size() * v.z;
+        for (li, line) in g.lines.iter().enumerate() {
+            let s: String = chars[line.start..line.end].iter().collect();
+            let cy = v.y(g.rect.y + (li as f32 + 0.5) * g.line_h);
+            let deco = (t.italic, t.underline, t.strike);
+            draw_run(pm, v, fonts, st.face(), px, x, cy, &s, col, deco);
+        }
+    } else {
+        draw_markdown(pm, v, fonts, t, g.rect.w, col, c);
     }
-    if let Some(e) = scene.editor.editing {
-        if e.target == EditTarget::FreeText(t.id) {
-            // A faint box shows where the text is while you type.
-            if let Some(p) = rounded_rect(
-                x - 4.0 * v.z,
-                y - 2.0 * v.z,
-                w + 8.0 * v.z,
-                h + 4.0 * v.z,
-                6.0 * v.z,
-            ) {
-                let st = SkStroke {
-                    width: v.hair(),
-                    ..SkStroke::default()
-                };
-                pm.stroke_path(
-                    &p,
-                    &paint(c.accent[0], 0xff, true),
-                    &st,
-                    Transform::identity(),
-                    None,
-                );
-            }
-            draw_text_sel(
-                pm,
-                v,
-                fonts,
-                scene,
-                e.target,
-                Some((t.x, t.y, TEXT_LINE_H)),
-                c.accent[0],
+    if editing {
+        let Some(e) = scene.editor.editing else {
+            return;
+        };
+        // A faint box shows where the text is while you type.
+        if let Some(p) = rounded_rect(
+            x - 4.0 * v.z,
+            y - 2.0 * v.z,
+            w + 8.0 * v.z,
+            h + 4.0 * v.z,
+            6.0 * v.z,
+        ) {
+            let st = SkStroke {
+                width: v.hair(),
+                ..SkStroke::default()
+            };
+            pm.stroke_path(
+                &p,
+                &paint(c.accent[0], 0xff, true),
+                &st,
+                Transform::identity(),
+                None,
             );
-            if let Some((cx, cy, ch)) = caret_for(
-                v,
-                fonts,
-                scene.board,
-                e.target,
-                e.caret,
-                Some((t.x, t.y, TEXT_LINE_H)),
-            ) {
-                draw_caret(pm, v, cx, cy, ch, c.text);
+        }
+        let gt = Some((t.x, t.y, g.line_h));
+        draw_text_sel(pm, v, fonts, scene, e.target, gt, c.accent[0]);
+        if let Some((cx, cy, ch)) = caret_for(v, fonts, scene.board, e.target, e.caret, gt) {
+            draw_caret(pm, v, cx, cy, ch, col);
+        }
+    }
+}
+
+/// A text box's Markdown, rendered (see `md`).
+fn draw_markdown(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    t: &TextBox,
+    box_w: f32,
+    col: Rgb,
+    c: &Colors,
+) {
+    let md = {
+        let f: &Fonts = fonts;
+        crate::md::layout(&t.text, t.size, t.bold, &|s, ch| {
+            f.advance(s.face(), ch, s.size())
+        })
+    };
+    let tf = Transform::identity();
+    for l in &md.lines {
+        let (top, bot) = (v.y(t.y + l.y), v.y(t.y + l.y + l.h));
+        if bot < 0.0 || top > v.h as f32 {
+            continue;
+        }
+        let cy = (top + bot) / 2.0;
+        let px = l.size.px() * v.z;
+        let px0 = v.x(t.x + l.prefix_x);
+        let mut tcol = col;
+        let (mut italic, mut strike) = (t.italic, t.strike);
+        match l.block {
+            Block::Rule => {
+                let r = Rect::from_xywh(v.x(t.x), cy, box_w * v.z, v.hair());
+                if let Some(r) = r {
+                    pm.fill_rect(r, &paint(c.sep, 0xff, false), tf, None);
+                }
+                continue;
+            }
+            Block::Bullet => {
+                let r = px * 0.15;
+                if let Some(p) = PathBuilder::from_circle(px0 + px * 0.45, cy, r) {
+                    if l.prefix_x > 0.0 && (l.prefix_x / (px * 1.2)).round() as i32 % 2 == 1 {
+                        let st = SkStroke {
+                            width: (px * 0.07).max(1.0),
+                            ..SkStroke::default()
+                        };
+                        pm.stroke_path(&p, &paint(col, 0xff, true), &st, tf, None);
+                    } else {
+                        pm.fill_path(&p, &paint(col, 0xff, true), FillRule::Winding, tf, None);
+                    }
+                }
+            }
+            Block::Number => {
+                let face = Style::Free(l.size, t.bold).face();
+                draw_run(pm, v, fonts, face, px, px0, cy, &l.marker, c.secondary, (false, false, false));
+            }
+            Block::Task(done) => {
+                let sz = px * 0.78;
+                let (bx, by) = (px0 + px * 0.05, cy - sz / 2.0);
+                if let Some(p) = rounded_rect(bx, by, sz, sz, sz * 0.25) {
+                    if done {
+                        pm.fill_path(&p, &paint(c.accent[0], 0xff, true), FillRule::Winding, tf, None);
+                        let mut pb = PathBuilder::new();
+                        pb.move_to(bx + sz * 0.24, by + sz * 0.52);
+                        pb.line_to(bx + sz * 0.43, by + sz * 0.7);
+                        pb.line_to(bx + sz * 0.77, by + sz * 0.3);
+                        if let Some(ck) = pb.finish() {
+                            let st = SkStroke {
+                                width: (sz * 0.13).max(1.0),
+                                line_cap: LineCap::Round,
+                                line_join: LineJoin::Round,
+                                ..SkStroke::default()
+                            };
+                            pm.stroke_path(&ck, &paint(WHITE, 0xff, true), &st, tf, None);
+                        }
+                    } else {
+                        let st = SkStroke {
+                            width: (px * 0.08).max(1.0),
+                            ..SkStroke::default()
+                        };
+                        pm.stroke_path(&p, &paint(c.secondary, 0xff, true), &st, tf, None);
+                    }
+                }
+                if done {
+                    tcol = c.tertiary;
+                    strike = true;
+                }
+            }
+            Block::Quote => {
+                if let Some(r) = Rect::from_xywh(px0 + px * 0.1, top + 2.0 * v.z, (px * 0.14).max(1.5), bot - top - 4.0 * v.z) {
+                    pm.fill_rect(r, &paint(c.accent[0], 0xff, false), tf, None);
+                }
+                tcol = c.secondary;
+                italic = true;
+            }
+            Block::Heading(_) | Block::Para => {}
+        }
+        for r in &l.runs {
+            let rx = v.x(t.x + r.x);
+            let rp = r.style.size() * v.z;
+            if r.code {
+                let pad = rp * 0.25;
+                if let Some(p) = rounded_rect(rx - pad, cy - rp * 0.7, r.w * v.z + 2.0 * pad, rp * 1.4, rp * 0.25) {
+                    let a = if c.dark { 60 } else { 30 };
+                    pm.fill_path(&p, &paint(c.secondary, a, true), FillRule::Winding, tf, None);
+                }
+            }
+            let deco = (italic || r.italic, t.underline, strike || r.strike);
+            let rc = if r.code && tcol == col { c.accent[3] } else { tcol };
+            draw_run(pm, v, fonts, r.style.face(), rp, rx, cy, &r.text, rc, deco);
+        }
+    }
+}
+
+/// The floating format bar and the drag grip of the focused text box (screen space).
+fn draw_text_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, c: &Colors) {
+    let Some(bar) = scene.text_bar else {
+        return;
+    };
+    let Some(t) = scene.board.text(bar.id) else {
+        return;
+    };
+    let s = v.scale;
+    let tf = Transform::identity();
+    // Grip: a small card with two columns of dots.
+    let g = bar.grip;
+    let grip_hot = scene.hover == Hover::Grip;
+    if let Some(p) = rounded_rect(g.x * s, g.y * s, g.w * s, g.h * s, 6.0 * s) {
+        let fill = if grip_hot { c.hover } else { c.card };
+        pm.fill_path(&p, &paint(fill, 235, true), FillRule::Winding, tf, None);
+        let st = SkStroke {
+            width: v.hair(),
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(c.sep, 0xff, true), &st, tf, None);
+    }
+    let dot = if grip_hot { c.text } else { c.secondary };
+    for col in 0..2 {
+        for row in 0..3 {
+            let cx = (g.x + g.w / 2.0 + (col as f32 - 0.5) * 6.0) * s;
+            let cy = (g.y + g.h / 2.0 + (row as f32 - 1.0) * 6.0) * s;
+            if let Some(p) = PathBuilder::from_circle(cx, cy, 1.7 * s) {
+                pm.fill_path(&p, &paint(dot, 0xff, true), FillRule::Winding, tf, None);
             }
         }
     }
+
+    pill(pm, v, bar.bar, c);
+    for x in &bar.seps {
+        let r = Rect::from_xywh(x * s, (bar.bar.y + 9.0) * s, v.hair(), (bar.bar.h - 18.0) * s);
+        if let Some(r) = r {
+            pm.fill_rect(r, &paint(c.sep, 0xff, false), tf, None);
+        }
+    }
+    for (btn, r) in &bar.btns {
+        let (x, y, w, h) = (r.x * s, r.y * s, r.w * s, r.h * s);
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        let hot = scene.hover == Hover::Fmt(*btn);
+        if let FmtBtn::Color(k) = btn {
+            let fill = if *k == 0 { c.text } else { c.accent[*k as usize % 10] };
+            let ring = if t.color == *k {
+                c.accent[0]
+            } else if hot {
+                c.secondary
+            } else {
+                c.card
+            };
+            draw_swatch(pm, v, cx, cy, fill, ring);
+            continue;
+        }
+        let active = match btn {
+            FmtBtn::Bold => t.bold,
+            FmtBtn::Italic => t.italic,
+            FmtBtn::Underline => t.underline,
+            FmtBtn::Strike => t.strike,
+            FmtBtn::Size(sz) => t.size == *sz,
+            FmtBtn::Markdown => !t.plain,
+            FmtBtn::Color(_) => false,
+        };
+        if active || hot {
+            if let Some(p) = rounded_rect(x, y, w, h, 8.0 * s) {
+                let fill = if active { c.accent[0] } else { c.hover };
+                pm.fill_path(&p, &paint(fill, 0xff, true), FillRule::Winding, tf, None);
+            }
+        }
+        let ink = if active {
+            WHITE
+        } else if hot {
+            c.text
+        } else {
+            c.secondary
+        };
+        let (label, face, px, deco) = match btn {
+            FmtBtn::Bold => ("B", Face::Bold, 15.0, (false, false, false)),
+            FmtBtn::Italic => ("I", Face::Regular, 15.0, (true, false, false)),
+            FmtBtn::Underline => ("U", Face::Regular, 15.0, (false, true, false)),
+            FmtBtn::Strike => ("S", Face::Regular, 15.0, (false, false, true)),
+            FmtBtn::Size(sz) => {
+                let px = match sz {
+                    crate::board::TextSize::Small => 10.0,
+                    crate::board::TextSize::Medium => 13.0,
+                    crate::board::TextSize::Heading => 16.0,
+                    crate::board::TextSize::Title => 20.0,
+                };
+                ("A", Face::Bold, px, (false, false, false))
+            }
+            FmtBtn::Markdown => ("MD", Face::Bold, 11.0, (false, false, false)),
+            FmtBtn::Color(_) => continue,
+        };
+        let px = px * s;
+        let tw = fonts.text_width(face, label, px);
+        draw_run(pm, v, fonts, face, px, cx - tw / 2.0, cy, label, ink, deco);
+    }
+}
+
+/// The rubber-band rectangle while dragging on empty canvas.
+fn draw_marquee(pm: &mut PixmapMut, v: &View, scene: &Scene, c: &Colors) {
+    let Some((x, y, w, h)) = scene.editor.marquee_rect() else {
+        return;
+    };
+    let (x, y, w, h) = v.rect(LRect::new(x, y, w, h));
+    let Some(p) = rounded_rect(x, y, w, h, 2.0 * v.z) else {
+        return;
+    };
+    let tf = Transform::identity();
+    pm.fill_path(
+        &p,
+        &paint(c.accent[0], 40, true),
+        FillRule::Winding,
+        tf,
+        None,
+    );
+    let st = SkStroke {
+        width: v.hair(),
+        ..SkStroke::default()
+    };
+    pm.stroke_path(&p, &paint(c.accent[0], 0xff, true), &st, tf, None);
 }
 
 /// Outline and resize handles of the selected item.
@@ -1415,18 +2067,20 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
     for (tool, r) in &o.tools {
         let active = scene.editor.tool == *tool;
         let (x, y, w, h) = (r.x * s, r.y * s, r.w * s, r.h * s);
-        if active {
+        let hot = !active && scene.hover == Hover::Tool(*tool);
+        if active || hot {
             if let Some(p) = rounded_rect(x, y, w, h, 10.0 * s) {
-                pm.fill_path(
-                    &p,
-                    &paint(c.accent[0], 0xff, true),
-                    FillRule::Winding,
-                    tf,
-                    None,
-                );
+                let fill = if active { c.accent[0] } else { c.hover };
+                pm.fill_path(&p, &paint(fill, 0xff, true), FillRule::Winding, tf, None);
             }
         }
-        let col = if active { WHITE } else { c.secondary };
+        let col = if active {
+            WHITE
+        } else if hot {
+            c.text
+        } else {
+            c.secondary
+        };
         draw_tool_icon(pm, v, *tool, x + w / 2.0, y + h / 2.0, col);
     }
 
@@ -1434,8 +2088,24 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
     pill(pm, v, o.view_pill, c);
     for (btn, rc) in &o.view_btns {
         let (cx, cy) = ((rc.x + rc.w / 2.0) * s, (rc.y + rc.h / 2.0) * s);
+        let open = *btn == ViewBtn::Theme && scene.theme_open;
+        let hot = scene.hover == Hover::View(*btn);
+        if open || hot {
+            if let Some(p) = rounded_rect(rc.x * s, rc.y * s, rc.w * s, rc.h * s, 10.0 * s) {
+                let fill = if open { c.accent[0] } else { c.hover };
+                pm.fill_path(&p, &paint(fill, 0xff, true), FillRule::Winding, tf, None);
+            }
+        }
+        let ic = if open {
+            WHITE
+        } else if hot {
+            c.text
+        } else {
+            c.secondary
+        };
         match btn {
-            ViewBtn::Help => draw_help_icon(pm, v, fonts, cx, cy, c.secondary),
+            ViewBtn::Theme => draw_theme_icon(pm, v, cx, cy, ic),
+            ViewBtn::Help => draw_help_icon(pm, v, fonts, cx, cy, ic),
             ViewBtn::Background => {
                 // A swatch of the current background: wallpaper shows as the accent colour.
                 let fill = if scene.background.image_on {
@@ -1443,9 +2113,9 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
                 } else {
                     scene.background.solid().unwrap_or(c.canvas)
                 };
-                draw_swatch(pm, v, cx, cy, fill, c.secondary);
+                draw_swatch(pm, v, cx, cy, fill, ic);
             }
-            _ => draw_zoom_icon(pm, v, *btn, cx, cy, c.secondary),
+            _ => draw_zoom_icon(pm, v, *btn, cx, cy, ic),
         }
     }
 
@@ -1454,25 +2124,27 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
         pill(pm, v, p, c);
     }
     for (ai, r) in &o.chips {
-        let Some(a) = scene.board.areas.get(*ai) else {
+        let Some(a) = scene.board.spaces.get(*ai) else {
             continue;
         };
         let current = scene.current_area == Some(*ai);
         let (x, y, w, h) = (r.x * s, r.y * s, r.w * s, r.h * s);
         let px = Style::ChipBold.size() * s;
         let tw = fonts.text_width(Face::Bold, &a.name, px);
-        if current {
+        let hot = !current && scene.hover == Hover::Chip(*ai);
+        if current || hot {
             if let Some(p) = rounded_rect(x, y, w, h, h / 2.0) {
-                pm.fill_path(
-                    &p,
-                    &paint(c.accent[a.color as usize % 10], 0xff, true),
-                    FillRule::Winding,
-                    tf,
-                    None,
-                );
+                let fill = if current { c.accent[*ai % 10] } else { c.hover };
+                pm.fill_path(&p, &paint(fill, 0xff, true), FillRule::Winding, tf, None);
             }
         }
-        let col = if current { WHITE } else { c.secondary };
+        let col = if current {
+            WHITE
+        } else if hot {
+            c.text
+        } else {
+            c.secondary
+        };
         text_px(
             pm,
             v,
@@ -1487,12 +2159,243 @@ fn draw_overlay(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, 
             false,
         );
     }
+    // The "+" button (adds a space) and chevrons when the menu is scrolled.
+    if let Some(r) = o.plus {
+        let (x, y, w, h) = (r.x * s, r.y * s, r.w * s, r.h * s);
+        if scene.hover == Hover::AddSpace {
+            if let Some(p) = rounded_rect(x, y, w, h, h / 2.0) {
+                pm.fill_path(&p, &paint(c.hover, 0xff, true), FillRule::Winding, tf, None);
+            }
+        }
+        let col = if scene.hover == Hover::AddSpace {
+            c.text
+        } else {
+            c.secondary
+        };
+        let (cx, cy, arm) = (x + w / 2.0, y + h / 2.0, 6.0 * s);
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - arm, cy);
+        pb.line_to(cx + arm, cy);
+        pb.move_to(cx, cy - arm);
+        pb.line_to(cx, cy + arm);
+        if let Some(p) = pb.finish() {
+            let st = SkStroke {
+                width: 1.8 * s,
+                line_cap: tiny_skia::LineCap::Round,
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint(col, 0xff, true), &st, tf, None);
+        }
+    }
+    if let Some(p) = o.chips_pill {
+        for (show, left) in [(o.more_left, true), (o.more_right, false)] {
+            if show {
+                let (glyph, x) = if left {
+                    ("‹", p.x - 14.0)
+                } else {
+                    ("›", p.right() + 4.0)
+                };
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Bold,
+                    18.0 * s,
+                    x * s,
+                    (p.y + p.h / 2.0) * s,
+                    glyph,
+                    c.secondary,
+                    full,
+                    false,
+                );
+            }
+        }
+    }
+    if scene.theme_open {
+        draw_theme_panel(pm, v, fonts, scene, c);
+    }
+    if let Some(d) = scene.detail {
+        draw_detail(pm, v, fonts, c, d);
+    }
+    if let Some(n) = scene.name_box {
+        draw_name_box(pm, v, fonts, c, n);
+    }
     if scene.show_help {
         draw_help(pm, v, fonts, c);
     }
 }
 
-const HELP_LEFT: [(&str, &str); 18] = [
+/// A palette glyph: a ring with the right half filled, centred on (cx, cy).
+fn draw_theme_icon(pm: &mut PixmapMut, v: &View, cx: f32, cy: f32, color: Rgb) {
+    let u = v.scale;
+    let tf = Transform::identity();
+    let r = 9.0 * u;
+    if let Some(p) = PathBuilder::from_circle(cx, cy, r) {
+        let st = SkStroke {
+            width: 1.8 * u,
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(color, 0xff, true), &st, tf, None);
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx, cy - r);
+    pb.cubic_to(cx + r * 0.55, cy - r, cx + r, cy - r * 0.55, cx + r, cy);
+    pb.cubic_to(cx + r, cy + r * 0.55, cx + r * 0.55, cy + r, cx, cy + r);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, &paint(color, 0xff, true), FillRule::Winding, tf, None);
+    }
+}
+
+/// The theme picker: one row per theme with a live miniature (that theme's canvas, a card, an
+/// accent dot and its edge/shadow style), its name and tagline.
+fn draw_theme_panel(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, scene: &Scene, c: &Colors) {
+    let o = scene.overlay;
+    let s = v.scale;
+    let tf = Transform::identity();
+    let full = (0.0, v.w as f32);
+    let pr = o.theme_panel;
+    let (px, py, pw, ph) = (pr.x * s, pr.y * s, pr.w * s, pr.h * s);
+    if let Some(p) = rounded_rect(px, py + 4.0 * s, pw, ph, 18.0 * s) {
+        pm.fill_path(
+            &p,
+            &paint((0, 0, 0), if c.dark { 70 } else { 30 }, true),
+            FillRule::Winding,
+            tf,
+            None,
+        );
+    }
+    if let Some(p) = rounded_rect(px, py, pw, ph, 18.0 * s) {
+        pm.fill_path(&p, &paint(c.card, 244, true), FillRule::Winding, tf, None);
+        let st = SkStroke {
+            width: v.hair(),
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(c.sep, 0xff, true), &st, tf, None);
+    }
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Bold,
+        15.0 * s,
+        px + 16.0 * s,
+        py + 20.0 * s,
+        "Theme",
+        c.text,
+        full,
+        false,
+    );
+    for (t, r) in &o.theme_items {
+        let (x, y, w, h) = (r.x * s, r.y * s, r.w * s, r.h * s);
+        let current = scene.theme == *t;
+        let hot = scene.hover == Hover::Theme(*t);
+        if current || hot {
+            if let Some(p) = rounded_rect(x, y, w, h, 12.0 * s) {
+                let fill = if current {
+                    mix(c.card, c.accent[0], 0.22)
+                } else {
+                    c.hover
+                };
+                pm.fill_path(&p, &paint(fill, 0xff, true), FillRule::Winding, tf, None);
+                if current {
+                    let st = SkStroke {
+                        width: 1.5 * s,
+                        ..SkStroke::default()
+                    };
+                    pm.stroke_path(&p, &paint(c.accent[0], 0xff, true), &st, tf, None);
+                }
+            }
+        }
+        // Miniature. Hovering lifts it slightly.
+        let tc = colors(*t);
+        let lift = if hot { -1.5 * s } else { 0.0 };
+        let (mx, my, mw, mh) = (x + 8.0 * s, y + 7.0 * s + lift, 40.0 * s, h - 14.0 * s);
+        if let Some(p) = rounded_rect(mx, my, mw, mh, 8.0 * s) {
+            pm.fill_path(
+                &p,
+                &paint(tc.canvas, 0xff, true),
+                FillRule::Winding,
+                tf,
+                None,
+            );
+            if let Some(cols) = tc.aurora {
+                if let Some(g) = PathBuilder::from_circle(mx + mw * 0.28, my + mh * 0.3, mh * 0.2) {
+                    pm.fill_path(&g, &paint(cols[0], 120, true), FillRule::Winding, tf, None);
+                }
+                if let Some(g) = PathBuilder::from_circle(mx + mw * 0.82, my + mh * 0.72, mh * 0.18)
+                {
+                    pm.fill_path(&g, &paint(cols[1], 110, true), FillRule::Winding, tf, None);
+                }
+            }
+            let st = SkStroke {
+                width: v.hair(),
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint(c.sep, 0xff, true), &st, tf, None);
+        }
+        let (cx0, cy0, cw0, ch0) = (mx + 6.0 * s, my + 6.0 * s, mw - 12.0 * s, mh - 12.0 * s);
+        if tc.shadow == Shadow::Hard {
+            if let Some(p) = rounded_rect(cx0 + 2.0 * s, cy0 + 2.0 * s, cw0, ch0, 3.0 * s) {
+                pm.fill_path(
+                    &p,
+                    &paint((0, 0, 0), 0xff, true),
+                    FillRule::Winding,
+                    tf,
+                    None,
+                );
+            }
+        }
+        if let Some(p) = rounded_rect(cx0, cy0, cw0, ch0, 4.0 * s * tc.radius_scale.max(0.5)) {
+            pm.fill_path(&p, &paint(tc.card, 0xff, true), FillRule::Winding, tf, None);
+            let edge = tc.edge.unwrap_or(tc.sep);
+            let st = SkStroke {
+                width: (v.hair() * tc.border_scale).max(1.0),
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint(edge, 0xff, true), &st, tf, None);
+        }
+        if let Some(p) = PathBuilder::from_circle(cx0 + 5.0 * s, cy0 + ch0 / 2.0, 2.5 * s) {
+            pm.fill_path(
+                &p,
+                &paint(tc.accent[0], 0xff, true),
+                FillRule::Winding,
+                tf,
+                None,
+            );
+        }
+        // Name and tagline.
+        let tx = x + 60.0 * s;
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Bold,
+            14.0 * s,
+            tx,
+            y + h * 0.34,
+            t.label(),
+            c.text,
+            full,
+            false,
+        );
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Regular,
+            11.0 * s,
+            tx,
+            y + h * 0.68,
+            t.tagline(),
+            c.secondary,
+            full,
+            false,
+        );
+    }
+}
+
+const HELP_LEFT: [(&str, &str); 22] = [
     ("V", "Select"),
     ("G", "Group card tool"),
     ("T", "Todo tool"),
@@ -1506,26 +2409,36 @@ const HELP_LEFT: [(&str, &str); 18] = [
     ("0", "Fit everything"),
     ("+ / -", "Zoom in / out"),
     ("C", "Capture"),
-    ("L", "Light / dark theme"),
+    ("L", "Light / dark"),
+    ("Shift+L", "Theme picker"),
     ("B", "Cycle background / wallpaper"),
     ("W", "Wallpaper rotation"),
     ("F / Shift+F", "Wallpaper folder: pick / open"),
+    ("Ctrl+B / I / U", "Text: bold / italic / underline"),
+    ("Ctrl+Shift+S", "Text: strike-through"),
+    ("Ctrl+[ / ]", "Text: smaller / bigger"),
     ("?", "This help"),
 ];
-const HELP_RIGHT: [(&str, &str); 16] = [
+const HELP_RIGHT: [(&str, &str); 22] = [
     ("Shift+click", "Add to selection"),
     ("Ctrl+G", "Lock selection together"),
     ("Ctrl+Shift+G", "Unlock group"),
     ("Delete", "Remove selected"),
     ("Esc", "Deselect / close"),
-    ("Ctrl+V", "Paste text / PNG image"),
+    ("Ctrl+C / Ctrl+X", "Copy / cut text or text box"),
+    ("Ctrl+V", "Paste text box / text / PNG"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Y", "Redo"),
     ("Ctrl+Enter", "Toggle todo done"),
     ("Ctrl+P", "Cycle priority"),
+    ("Ctrl+D", "Todo details / duplicate text"),
+    ("Drag text grip", "Move text, even while typing"),
+    ("Ctrl+Left/Right", "Previous / next space"),
     ("Double-click", "Edit / new group"),
     ("Right-click", "Remove item"),
-    ("Scroll / drag", "Pan the canvas"),
+    ("Scroll / mid-drag", "Pan the canvas"),
+    ("Drag empty space", "Select items to group/delete"),
+    ("Top menu +", "New space (dbl-click name: rename)"),
     ("Ctrl+scroll", "Zoom"),
     ("Dbl-click sticker", "Next emoji"),
     ("Ctrl+Q", "Quit"),
@@ -1551,13 +2464,360 @@ fn draw_help_icon(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, cx: f32, cy: 
 }
 
 /// The centred keyboard shortcuts popup.
+/// The small popup that names a space.
+fn draw_name_box(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    c: &Colors,
+    n: &crate::detail::NameBox,
+) {
+    let s = v.scale;
+    let tf = Transform::identity();
+    let (card, field) = crate::detail::name_panel(v.w as f32 / s, v.h as f32 / s);
+    if let Some(p) = rounded_rect(0.0, 0.0, v.w as f32, v.h as f32, 0.0) {
+        pm.fill_path(
+            &p,
+            &paint((0, 0, 0), 110, true),
+            FillRule::Winding,
+            tf,
+            None,
+        );
+    }
+    if let Some(p) = rounded_rect(card.0 * s, card.1 * s, card.2 * s, card.3 * s, 16.0 * s) {
+        pm.fill_path(&p, &paint(c.card, 0xff, true), FillRule::Winding, tf, None);
+        let st = SkStroke {
+            width: v.hair(),
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(c.sep, 0xff, true), &st, tf, None);
+    }
+    let full = (0.0, v.w as f32);
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Bold,
+        17.0 * s,
+        field.0 * s,
+        (card.1 + 34.0) * s,
+        n.title(),
+        c.text,
+        full,
+        false,
+    );
+    let (x, y, w, h) = field;
+    if let Some(p) = rounded_rect(x * s, y * s, w * s, h * s, 8.0 * s) {
+        pm.fill_path(&p, &paint(c.hover, 0xff, true), FillRule::Winding, tf, None);
+        let st = SkStroke {
+            width: 2.0 * s,
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(c.accent[0], 0xff, true), &st, tf, None);
+    }
+    let size = 14.0 * s;
+    let clip = ((x + 10.0) * s, (x + w - 10.0) * s);
+    let cy = (y + h / 2.0) * s;
+    let pre: f32 = n
+        .text
+        .chars()
+        .take(n.caret)
+        .map(|ch| fonts.advance(Face::Regular, ch, size))
+        .sum();
+    let scroll = scroll_x((w - 20.0) * s, pre);
+    if n.fresh && !n.text.is_empty() {
+        // the suggested name is shown selected
+        let tw = fonts
+            .text_width(Face::Regular, &n.text, size)
+            .min(clip.1 - clip.0);
+        if let Some(p) = rounded_rect(
+            clip.0 - 2.0 * s,
+            cy - 10.0 * s,
+            tw + 4.0 * s,
+            20.0 * s,
+            4.0 * s,
+        ) {
+            pm.fill_path(
+                &p,
+                &paint(c.accent[0], 70, true),
+                FillRule::Winding,
+                tf,
+                None,
+            );
+        }
+    }
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Regular,
+        size,
+        clip.0 - scroll,
+        cy,
+        &n.text,
+        c.text,
+        clip,
+        false,
+    );
+    draw_caret(pm, v, clip.0 + pre - scroll, cy, 16.0 * s, c.text);
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Regular,
+        12.0 * s,
+        field.0 * s,
+        (card.1 + card.3 - 18.0) * s,
+        "Enter save · Esc cancel",
+        c.tertiary,
+        full,
+        false,
+    );
+}
+
+/// The todo detail page: dimmed backdrop, card, and three fields (title, description, due date).
+fn draw_detail(
+    pm: &mut PixmapMut,
+    v: &View,
+    fonts: &mut Fonts,
+    c: &Colors,
+    d: &crate::detail::Detail,
+) {
+    use crate::detail::{self as dt, Field};
+    let s = v.scale;
+    let tf = Transform::identity();
+    let (vw, vh) = (v.w as f32 / s, v.h as f32 / s);
+    let pn = dt::panel(vw, vh);
+    if let Some(p) = rounded_rect(0.0, 0.0, v.w as f32, v.h as f32, 0.0) {
+        pm.fill_path(
+            &p,
+            &paint((0, 0, 0), 110, true),
+            FillRule::Winding,
+            tf,
+            None,
+        );
+    }
+    let (cx, cy, cw, ch) = pn.card;
+    if let Some(p) = rounded_rect(cx * s, cy * s, cw * s, ch * s, 16.0 * s) {
+        pm.fill_path(&p, &paint(c.card, 0xff, true), FillRule::Winding, tf, None);
+        let st = SkStroke {
+            width: v.hair(),
+            ..SkStroke::default()
+        };
+        pm.stroke_path(&p, &paint(c.sep, 0xff, true), &st, tf, None);
+    }
+    let full = (0.0, v.w as f32);
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Bold,
+        17.0 * s,
+        (cx + dt::PANEL_PAD) * s,
+        (cy + dt::PANEL_PAD + 10.0) * s,
+        "Todo details",
+        c.text,
+        full,
+        false,
+    );
+    let size = 14.0 * s;
+    let line_h = 20.0;
+    let today = dt::today();
+    for (field, rect, label) in [
+        (Field::Title, pn.title, "Title"),
+        (Field::Desc, pn.desc, "Description"),
+        (Field::Due, pn.due, "Due date (YYYY-MM-DD)"),
+    ] {
+        let (x, y, w, h) = rect;
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Bold,
+            12.0 * s,
+            x * s,
+            (y - dt::LABEL_H / 2.0) * s,
+            label,
+            c.secondary,
+            full,
+            false,
+        );
+        let active = d.field == field;
+        let bad = field == Field::Due && !d.due_valid();
+        let border = if bad {
+            c.accent[3]
+        } else if active {
+            c.accent[0]
+        } else {
+            c.sep
+        };
+        if let Some(p) = rounded_rect(x * s, y * s, w * s, h * s, 8.0 * s) {
+            pm.fill_path(&p, &paint(c.hover, 0xff, true), FillRule::Winding, tf, None);
+            let st = SkStroke {
+                width: if active { 2.0 * s } else { v.hair() },
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint(border, 0xff, true), &st, tf, None);
+        }
+        let text = d.text(field);
+        let inner_w = (w - 20.0) * s;
+        let clip = ((x + 10.0) * s, (x + w - 10.0) * s);
+        let chars: Vec<char> = text.chars().collect();
+        // Widths are looked up once so the closure does not hold `fonts` while text is drawn.
+        let widths: std::collections::HashMap<char, f32> = chars
+            .iter()
+            .map(|&ch| (ch, fonts.advance(Face::Regular, ch, size)))
+            .collect();
+        let adv = |ch: char| widths.get(&ch).copied().unwrap_or(0.0);
+        if field == Field::Desc {
+            let lines = crate::text::wrap(&chars, inner_w, &adv);
+            let rows_fit = ((h - 12.0) / line_h).floor().max(1.0) as usize;
+            let caret_line = if active { line_of(&lines, d.caret) } else { 0 };
+            let first = (caret_line + 1).saturating_sub(rows_fit);
+            if chars.is_empty() && !active {
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Regular,
+                    size,
+                    clip.0,
+                    (y + 6.0 + line_h / 2.0) * s,
+                    "Add details…",
+                    c.tertiary,
+                    clip,
+                    false,
+                );
+            }
+            for (i, ln) in lines.iter().enumerate().skip(first).take(rows_fit) {
+                let t: String = chars[ln.start..ln.end]
+                    .iter()
+                    .filter(|c| **c != '\n')
+                    .collect();
+                let ly = (y + 6.0 + (i - first) as f32 * line_h + line_h / 2.0) * s;
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Regular,
+                    size,
+                    clip.0,
+                    ly,
+                    &t,
+                    c.text,
+                    clip,
+                    false,
+                );
+                if active && i == caret_line {
+                    let pre: f32 = chars[ln.start..d.caret.clamp(ln.start, ln.end)]
+                        .iter()
+                        .map(|&ch| adv(ch))
+                        .sum();
+                    draw_caret(pm, v, clip.0 + pre, ly, line_h * s * 0.8, c.text);
+                }
+            }
+        } else {
+            let cy_mid = (y + h / 2.0) * s;
+            let pre: f32 = chars[..d.caret.min(chars.len())]
+                .iter()
+                .map(|&ch| adv(ch))
+                .sum::<f32>();
+            let scroll = if active { scroll_x(inner_w, pre) } else { 0.0 };
+            if chars.is_empty() {
+                let hint = if field == Field::Due { "none" } else { "" };
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Regular,
+                    size,
+                    clip.0,
+                    cy_mid,
+                    hint,
+                    c.tertiary,
+                    clip,
+                    false,
+                );
+            } else {
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Regular,
+                    size,
+                    clip.0 - scroll,
+                    cy_mid,
+                    text,
+                    c.text,
+                    clip,
+                    false,
+                );
+            }
+            if active {
+                draw_caret(
+                    pm,
+                    v,
+                    clip.0 + pre - scroll,
+                    cy_mid,
+                    line_h * s * 0.8,
+                    c.text,
+                );
+            }
+        }
+    }
+    // Footer: what the due date means today, and the keys.
+    let (fx, fy) = (
+        pn.card.0 + dt::PANEL_PAD,
+        pn.card.1 + pn.card.3 - dt::FOOT_H + 6.0,
+    );
+    let note = match dt::days_until(d.due.trim(), today) {
+        _ if !d.due_valid() => "Not a valid date".to_string(),
+        Some(n) if n < 0 => format!("Overdue by {} day(s)", -n),
+        Some(0) => "Due today".to_string(),
+        Some(n) => format!("Due in {n} day(s)"),
+        None => String::new(),
+    };
+    text_px(
+        pm,
+        v,
+        fonts,
+        Face::Regular,
+        12.0 * s,
+        fx * s,
+        fy * s,
+        "Tab next · Enter/Ctrl+Enter save · Esc cancel",
+        c.tertiary,
+        full,
+        false,
+    );
+    if !note.is_empty() {
+        let late = !d.due_valid() || dt::overdue(d.due.trim(), today);
+        let col = if late { c.accent[3] } else { c.secondary };
+        let w = fonts.text_width(Face::Regular, &note, 12.0 * s);
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Regular,
+            12.0 * s,
+            (cx + cw - dt::PANEL_PAD) * s - w,
+            fy * s,
+            &note,
+            col,
+            full,
+            false,
+        );
+    }
+}
+
 fn draw_help(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, c: &Colors) {
     let s = v.scale;
     let tf = Transform::identity();
     let (vw, vh) = (v.w as f32 / s, v.h as f32 / s);
     let (col_w, row_h, pad) = (300.0_f32, 26.0_f32, 24.0_f32);
     let pw = (2.0 * col_w + 3.0 * pad).min(vw - 20.0);
-    let ph = (HELP_LEFT.len() as f32 * row_h + 2.0 * pad + 40.0).min(vh - 20.0);
+    let ph =
+        (HELP_LEFT.len().max(HELP_RIGHT.len()) as f32 * row_h + 2.0 * pad + 40.0).min(vh - 20.0);
     let (px, py) = ((vw - pw) / 2.0, (vh - ph) / 2.0);
     if let Some(p) = rounded_rect(0.0, 0.0, v.w as f32, v.h as f32, 0.0) {
         pm.fill_path(&p, &paint((0, 0, 0), 90, true), FillRule::Winding, tf, None);
@@ -1964,11 +3224,17 @@ mod tests {
                 board: &self.board,
                 editor: &self.editor,
                 theme: self.theme,
+                palette: None,
                 background: &self.bg,
                 wallpaper: self.wp.as_deref(),
                 overlay: &ov,
                 current_area: Some(1),
                 show_help: false,
+                detail: None,
+                name_box: None,
+                theme_open: false,
+                hover: Hover::None,
+                text_bar: None,
             };
             let mut buf = vec![0u8; (self.w * self.h * 4) as usize];
             draw(
@@ -2055,6 +3321,19 @@ mod tests {
             hair.0 > canvas.0 && hair.0 <= sep.0,
             "a 1px hairline straddling a pixel edge is a canvas/separator blend: {hair:?}"
         );
+    }
+
+    #[test]
+    fn theme_blend_hits_both_ends_and_glides_in_between() {
+        let (a, b) = (colors(Theme::Dark), colors(Theme::Brutal));
+        let start = lerp_colors(&a, &b, 0.0);
+        let end = lerp_colors(&a, &b, 1.0);
+        assert_eq!((start.canvas, start.shadow), (a.canvas, a.shadow));
+        assert_eq!((end.canvas, end.shadow), (b.canvas, b.shadow));
+        let mid = lerp_colors(&a, &b, 0.5);
+        assert_ne!(mid.canvas, a.canvas);
+        assert_ne!(mid.canvas, b.canvas);
+        assert!(mid.radius_scale < a.radius_scale && mid.radius_scale > b.radius_scale);
     }
 
     #[test]
@@ -2148,6 +3427,7 @@ mod tests {
                 done: true,
                 priority: 0,
                 body: None,
+                due: None,
             },
         ];
         let g = r.geom(2);
@@ -2197,6 +3477,7 @@ mod tests {
             done: false,
             priority: 3,
             body: None,
+            due: None,
         }];
         let g = r.geom(2);
         let buf = r.frame();
@@ -2472,8 +3753,11 @@ mod tests {
     }
 
     #[test]
-    fn current_chip_is_filled_with_its_area_colour() {
-        let r = Rig::new();
+    fn current_chip_is_filled_with_its_space_colour() {
+        let mut r = Rig::new();
+        for n in ["Home", "Docs", "Plans"] {
+            r.board.add_space(n, 0.0, 0.0, 1.0);
+        }
         let buf = r.frame();
         let mut f = fonts();
         let ov = overlay(
@@ -2484,7 +3768,7 @@ mod tests {
             &|s, t| f.text_width(s.face(), t, s.size()),
         );
         let _ = &mut f;
-        let (ai, rect) = ov.chips[1]; // Focus is the "current" area in the rig
+        let (ai, rect) = ov.chips[1]; // the rig marks index 1 as current
         assert_eq!(ai, 1);
         let col = px(
             &buf,
@@ -2492,10 +3776,7 @@ mod tests {
             (rect.x + 3.0) as u32,
             (rect.y + rect.h / 2.0) as u32,
         );
-        assert_eq!(
-            col,
-            colors(Theme::Dark).accent[r.board.areas[1].color as usize]
-        );
+        assert_eq!(col, colors(Theme::Dark).accent[1]);
     }
 
     #[test]
@@ -2616,6 +3897,7 @@ mod dump {
                 done: true,
                 priority: 2,
                 body: Some("details here\nsecond line".into()),
+                due: None,
             },
         ];
         board.areas[1].todos = vec![
@@ -2634,7 +3916,8 @@ mod dump {
         ];
         let editor = Editor::new();
         let (w, h) = (1920u32, 1080u32);
-        for (name, theme) in [("dark", Theme::Dark), ("light", Theme::Light)] {
+        for theme in Theme::ALL {
+            let name = theme.label().to_lowercase();
             let ov = {
                 let ff: &Fonts = &f;
                 overlay(
@@ -2650,11 +3933,17 @@ mod dump {
                 board: &board,
                 editor: &editor,
                 theme,
+                palette: None,
                 background: &bg,
                 wallpaper: None,
                 overlay: &ov,
                 current_area: Some(1),
                 show_help: false,
+                detail: None,
+                name_box: None,
+                theme_open: theme == Theme::Aurora || theme == Theme::Brutal,
+                hover: Hover::Theme(Theme::Neon),
+                text_bar: None,
             };
             let mut buf = vec![0u8; (w * h * 4) as usize];
             draw(
@@ -2677,5 +3966,1263 @@ mod dump {
             pm.save_png(std::path::Path::new(&dir).join(format!("ui_{name}.png")))
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod dump_text {
+    use super::*;
+    use crate::board::TextSize;
+    use crate::layout::{overlay, text_bar, Margins};
+    /// `WB_DUMP=/dir cargo test dump_text_styles`: styled and Markdown text, with the format bar.
+    #[test]
+    fn dump_text_styles() {
+        let Some(dir) = std::env::var_os("WB_DUMP") else {
+            return;
+        };
+        let mut f = Fonts::load().unwrap().0;
+        let mut board = Board::new();
+        let md = board.add_text(110.0, 60.0);
+        board.text_mut(md).unwrap().text = "# Weekly plan\n## Goals\nShip **wallboard** with *rich* text, ~~no bugs~~ and `code`\n- first bullet\n  - nested bullet\n1. numbered\n2. second\n- [ ] open task\n- [x] done task\n> a quote worth keeping\n---\nplain line after the rule".into();
+        let st = board.add_text(820.0, 90.0);
+        {
+            let t = board.text_mut(st).unwrap();
+            t.text = "Bold italic heading\nunderlined in red".into();
+            (t.size, t.bold, t.italic, t.underline, t.color) = (TextSize::Heading, true, true, true, 3);
+        }
+        let sm = board.add_text(820.0, 300.0);
+        {
+            let t = board.text_mut(sm).unwrap();
+            t.text = "small struck text".into();
+            (t.size, t.strike) = (TextSize::Small, true);
+        }
+        let mut editor = Editor::new();
+        editor.selected = Some(Sel::Text(st));
+        let (w, h) = (1400u32, 800u32);
+        let cam = Camera { x: 0.0, y: -40.0, zoom: 1.0 };
+        for theme in [Theme::Dark, Theme::Light] {
+            let ff: &Fonts = &f;
+            let adv = |s: Style, ch: char| ff.advance(s.face(), ch, s.size());
+            let ov = overlay(&board, w as f32, h as f32, Margins::default(), &|s, t| {
+                ff.text_width(s.face(), t, s.size())
+            });
+            let bar = text_bar(&board, st, &cam, (w as f32, h as f32), &adv);
+            let bg = Background::default();
+            let scene = Scene {
+                board: &board,
+                editor: &editor,
+                theme,
+                palette: None,
+                background: &bg,
+                wallpaper: None,
+                overlay: &ov,
+                current_area: None,
+                show_help: false,
+                detail: None,
+                name_box: None,
+                theme_open: false,
+                hover: Hover::Fmt(FmtBtn::Size(TextSize::Title)),
+                text_bar: bar.as_ref(),
+            };
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            draw(&mut buf, w, h, &cam, 1, &scene, &mut f);
+            for p in buf.as_chunks_mut::<4>().0 {
+                *p = [p[2], p[1], p[0], 255];
+            }
+            let pm = Pixmap::from_vec(buf, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap();
+            let name = format!("text_{}.png", theme.label().to_lowercase());
+            pm.save_png(std::path::Path::new(&dir).join(name)).unwrap();
+        }
+    }
+}
+
+/// Renders the marketing reel (portrait 1080x1920, 30 fps) with the real renderer, as PNG frames.
+/// Run: `WB_DEMO=/some/dir cargo test --release demo_video -- --nocapture`, then encode with
+/// ffmpeg. Test-only: it is never part of the shipped binary.
+#[cfg(test)]
+mod demo {
+    use super::*;
+    use crate::board::Todo;
+    use crate::layout::{overlay, Margins};
+
+    const FPS: f32 = 30.0;
+    const DUR: f32 = 21.0;
+    const LW: f32 = 540.0;
+    const LH: f32 = 960.0;
+    const BLEND: f32 = 0.3;
+
+    fn ss(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Piecewise smoothstep through keyframes (time, values...).
+    fn keys<const N: usize>(k: &[(f32, [f32; N])], t: f32) -> [f32; N] {
+        if t <= k[0].0 {
+            return k[0].1;
+        }
+        for w in k.windows(2) {
+            if t <= w[1].0 {
+                let u = ss((t - w[0].0) / (w[1].0 - w[0].0));
+                let mut out = [0.0; N];
+                for i in 0..N {
+                    out[i] = w[0].1[i] + (w[1].1[i] - w[0].1[i]) * u;
+                }
+                return out;
+            }
+        }
+        k[k.len() - 1].1
+    }
+
+    fn todo(text: &str, done: bool, priority: u8) -> Todo {
+        Todo {
+            text: text.into(),
+            done,
+            priority,
+            body: None,
+            due: None,
+        }
+    }
+
+    /// The board at time `t`: positions are fixed (laid out for the final content), content grows.
+    fn board_at(t: f32, f: &Fonts, land: bool) -> Board {
+        let mut b = Board::default_board();
+        let typed = "Post the reel on Instagram";
+        let n = (((t - 3.9) / 0.06).max(0.0) as usize).min(typed.chars().count());
+        let ship_done = t > 6.0;
+        let content: [(usize, Vec<Todo>); 7] = [
+            (
+                0,
+                vec![
+                    todo("Call the dentist", false, 0),
+                    todo("Pay electricity bill", false, 1),
+                ],
+            ),
+            (1, {
+                let mut v = vec![
+                    todo("Ship wallboard v1", ship_done, 3),
+                    todo("Record launch reel", true, 2),
+                ];
+                if n > 0 {
+                    v.push(todo(&typed.chars().take(n).collect::<String>(), false, 0));
+                }
+                v
+            }),
+            (
+                2,
+                vec![
+                    todo("Review pull requests", false, 0),
+                    todo("Write release notes", true, 0),
+                    todo("Fix flaky test", false, 1),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    todo("Talk to 5 users", false, 2),
+                    todo("Draft pitch deck", false, 0),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    todo("Morning run", true, 0),
+                    todo("Stretch 10 min", false, 0),
+                    todo("Drink more water", false, 0),
+                ],
+            ),
+            (
+                5,
+                vec![
+                    todo("Rust lifetimes chapter", false, 0),
+                    todo("Wayland protocol notes", false, 0),
+                ],
+            ),
+            (
+                6,
+                vec![todo("Book flights", false, 1), todo("Groceries", false, 0)],
+            ),
+        ];
+        // Final-content copy used only to compute stable positions.
+        let adv = |s: Style, ch: char| f.advance(s.face(), ch, s.size());
+        let mut full = Board::default_board();
+        for (i, v) in &content {
+            full.areas[*i].todos = v.clone();
+        }
+        if full.areas[1].todos.len() < 3 {
+            full.areas[1].todos.push(todo(typed, false, 0));
+        }
+        let h = |i: usize| area_geom(&full.areas[i], &adv).card.h;
+        let (lx, rx, gap) = (0.0_f32, 430.0_f32, 28.0_f32);
+        let (n1_pos, n2_pos, stroke_pos);
+        if land {
+            // Three columns, three rows: a landscape desktop.
+            let cols = [0.0_f32, 348.0, 776.0];
+            let rows: [[usize; 3]; 3] = [[0, 1, 2], [3, 4, 5], [6, 6, 6]];
+            let mut y = 0.0;
+            for (ri, row) in rows.iter().enumerate() {
+                let mut hmax: f32 = 0.0;
+                for (ci, &i) in row.iter().enumerate() {
+                    if ri == 2 && ci > 0 {
+                        continue;
+                    }
+                    b.areas[i].x = cols[ci];
+                    b.areas[i].y = y;
+                    hmax = hmax.max(h(i));
+                }
+                y += hmax + gap;
+            }
+            let ry = b.areas[6].y;
+            n1_pos = (cols[1], ry);
+            n2_pos = (cols[2], ry + 10.0);
+            stroke_pos = (cols[1] + 10.0, ry + 160.0);
+        } else {
+            // Two columns: left Focus, Work, Health, Life; right Inbox, Startups, Learning.
+            let mut y = 0.0;
+            for i in [1usize, 2, 4, 6] {
+                b.areas[i].x = lx;
+                b.areas[i].y = y;
+                y += h(i) + gap;
+            }
+            let mut y2 = 0.0;
+            for i in [0usize, 3, 5] {
+                b.areas[i].x = rx;
+                b.areas[i].y = y2;
+                y2 += h(i) + gap;
+            }
+            n1_pos = (rx, y2);
+            n2_pos = (rx + 40.0, y2 + 190.0);
+            stroke_pos = (rx + 10.0, y2 + 380.0);
+        }
+        for (i, v) in content {
+            b.areas[i].todos = v;
+        }
+        let n1 = b.add_note(n1_pos.0, n1_pos.1);
+        b.note_mut(n1).unwrap().title = "Idea".into();
+        b.note_mut(n1).unwrap().body = "Everything in one calm place, right on the desktop.".into();
+        b.note_mut(n1).unwrap().color = 4;
+        let n2 = b.add_note(n2_pos.0, n2_pos.1);
+        b.note_mut(n2).unwrap().title = "Reading".into();
+        b.note_mut(n2).unwrap().body = "The Rust book, ch. 10".into();
+        b.note_mut(n2).unwrap().color = 1;
+        let s = b.add_stroke(stroke_pos.0, stroke_pos.1, 2);
+        b.stroke_mut(s).unwrap().pts = (0..24)
+            .map(|i| {
+                let x = i as f32 * 12.0;
+                (stroke_pos.0 + x, stroke_pos.1 + (x * 0.09).sin() * 14.0)
+            })
+            .collect();
+        b
+    }
+
+    struct Blend {
+        from: Colors,
+        to: Theme,
+        t0: f32,
+    }
+    impl Blend {
+        fn at(&mut self, target: Theme, now: f32) -> Colors {
+            if target != self.to {
+                let p = ss((now - self.t0) / BLEND);
+                self.from = lerp_colors(&self.from, &colors(self.to), p);
+                self.to = target;
+                self.t0 = now;
+            }
+            lerp_colors(&self.from, &colors(self.to), ss((now - self.t0) / BLEND))
+        }
+    }
+
+    fn cursor(pm: &mut PixmapMut, s: f32, x: f32, y: f32) {
+        let pts = [
+            (0.0, 0.0),
+            (0.0, 17.0),
+            (4.5, 13.0),
+            (8.0, 20.0),
+            (11.0, 18.5),
+            (7.5, 12.0),
+            (13.0, 12.0),
+        ];
+        let mut pb = PathBuilder::new();
+        for (i, (px, py)) in pts.iter().enumerate() {
+            let (px, py) = (x * s + px * s * 1.3, y * s + py * s * 1.3);
+            if i == 0 {
+                pb.move_to(px, py);
+            } else {
+                pb.line_to(px, py);
+            }
+        }
+        pb.close();
+        if let Some(p) = pb.finish() {
+            let tf = Transform::identity();
+            pm.fill_path(&p, &paint(WHITE, 0xff, true), FillRule::Winding, tf, None);
+            let st = SkStroke {
+                width: 1.6 * s,
+                line_join: LineJoin::Round,
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint((0, 0, 0), 0xff, true), &st, tf, None);
+        }
+    }
+
+    fn caption(
+        pm: &mut PixmapMut,
+        v: &View,
+        fonts: &mut Fonts,
+        text: &str,
+        a: f32,
+        cy: f32,
+        size: f32,
+        bold: bool,
+    ) {
+        if a <= 0.01 {
+            return;
+        }
+        let s = v.scale;
+        let face = if bold { Face::Bold } else { Face::Regular };
+        let tw = fonts.text_width(face, text, size * s);
+        let (pw, ph) = (tw + 44.0 * s, size * s * 1.9);
+        let (x, y) = ((v.w as f32 - pw) / 2.0, cy * s - ph / 2.0);
+        if let Some(p) = rounded_rect(x, y, pw, ph, ph / 2.0) {
+            pm.fill_path(
+                &p,
+                &paint((10, 10, 14), (170.0 * a) as u8, true),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        let col = mix((20, 20, 24), WHITE, a);
+        text_px(
+            pm,
+            v,
+            fonts,
+            face,
+            size * s,
+            x + 22.0 * s,
+            cy * s,
+            text,
+            col,
+            (0.0, v.w as f32),
+            false,
+        );
+    }
+
+    #[test]
+    fn demo_video() {
+        let Some(dir) = std::env::var_os("WB_DEMO") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = Fonts::load().unwrap().0;
+        let scale = 2u32;
+        let (w, h) = ((LW as u32) * scale, (LH as u32) * scale);
+        let editor = Editor::new();
+        let bg = Background::default();
+        let margins = Margins { top: 150.0 };
+
+        // Stable geometry from the final board.
+        let b_final = board_at(DUR, &f, false);
+        let adv = |s: Style, ch: char| f.advance(s.face(), ch, s.size());
+        let focus = area_geom(&b_final.areas[1], &adv).card;
+        let bottom = b_final
+            .areas
+            .iter()
+            .map(|a| area_geom(a, &adv).card.bottom())
+            .fold(0.0, f32::max);
+        let wide_cy = bottom / 2.0 - 10.0;
+        let notes_cy = b_final.notes[0].y + 120.0;
+
+        // Theme-tour cursor targets (logical px), from the real overlay layout.
+        let ov0 = {
+            let ff: &Fonts = &f;
+            overlay(&b_final, LW, LH, margins, &|s, t| {
+                ff.text_width(s.face(), t, s.size())
+            })
+        };
+        let centre = |r: LRect| (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let theme_btn = centre(
+            ov0.view_btns
+                .iter()
+                .find(|(b, _)| *b == ViewBtn::Theme)
+                .unwrap()
+                .1,
+        );
+        let row = |t: Theme| centre(ov0.theme_items.iter().find(|(x, _)| *x == t).unwrap().1);
+
+        let tour = [
+            Theme::Light,
+            Theme::Paper,
+            Theme::Brutal,
+            Theme::Blueprint,
+            Theme::Neon,
+            Theme::Aurora,
+        ];
+        // Cursor keyframes: (time, x, y).
+        let mut ck: Vec<(f32, [f32; 2])> = vec![
+            (0.0, [300.0, 800.0]),
+            (9.6, [300.0, 800.0]),
+            (10.6, [theme_btn.0, theme_btn.1]),
+        ];
+        let mut t = 11.4;
+        for th in tour {
+            let r = row(th);
+            ck.push((t, [r.0, r.1]));
+            ck.push((t + 0.9, [r.0 + 2.0, r.1 + 2.0]));
+            t += 1.25;
+        }
+        let tour_end = t; // ~ 18.9
+        ck.push((tour_end + 0.7, [330.0, 760.0]));
+        let click_open = 10.8_f32;
+        let panel_close = tour_end - 0.3;
+        let choose_at = |i: usize| 11.4 + 1.25 * i as f32 + 0.5;
+
+        let mut blend = Blend {
+            from: colors(Theme::Dark),
+            to: Theme::Dark,
+            t0: -10.0,
+        };
+        let caps: [(f32, f32, &str); 5] = [
+            (0.5, 3.2, "Your whole life, on your desktop"),
+            (3.5, 8.8, "Todos, notes & sketches on an infinite canvas"),
+            (9.0, 10.5, "Now make it yours"),
+            (11.0, 18.3, "7 themes. Hover to preview live."),
+            (
+                18.9,
+                21.0,
+                "wallboard · a life-OS for niri · Rust · ~15 MB RAM",
+            ),
+        ];
+
+        let frames = (DUR * FPS) as usize;
+        for fr in 0..frames {
+            let t = fr as f32 / FPS;
+            let board = board_at(t, &f, false);
+            // Camera.
+            let z_wide = 0.54;
+            let k = keys(
+                &[
+                    (0.0, [375.0, wide_cy, 0.50]),
+                    (3.0, [375.0, wide_cy, 0.54]),
+                    (
+                        3.8,
+                        [
+                            focus.x + focus.w / 2.0,
+                            focus.y + focus.h / 2.0 + 10.0,
+                            0.93,
+                        ],
+                    ),
+                    (
+                        7.0,
+                        [
+                            focus.x + focus.w / 2.0,
+                            focus.y + focus.h / 2.0 + 10.0,
+                            0.97,
+                        ],
+                    ),
+                    (8.2, [590.0, notes_cy, 0.95]),
+                    (9.4, [590.0, notes_cy, 0.98]),
+                    (10.4, [375.0, wide_cy, z_wide]),
+                    (19.0, [375.0, wide_cy, z_wide + 0.015]),
+                    (21.0, [375.0, wide_cy, 0.50]),
+                ],
+                t,
+            );
+            let (cx, cy, z) = (k[0], k[1], k[2]);
+            let cam = Camera {
+                x: cx - LW / 2.0 / z,
+                y: cy - LH / 2.0 / z,
+                zoom: z,
+            };
+            // Cursor + hover + panel state.
+            let cpos = {
+                let pts: Vec<(f32, [f32; 2])> = ck.clone();
+                keys(&pts, t)
+            };
+            let mut cur = Theme::Dark;
+            let mut open = false;
+            if t >= click_open && t < panel_close {
+                open = true;
+            }
+            for (i, th) in tour.iter().enumerate() {
+                if t >= choose_at(i) && *th == Theme::Aurora {
+                    cur = Theme::Aurora;
+                }
+            }
+            let ov = {
+                let ff: &Fonts = &f;
+                overlay(&board, LW, LH, margins, &|s, t| {
+                    ff.text_width(s.face(), t, s.size())
+                })
+            };
+            let hover = if t > 10.0 {
+                ov.hover_at(cpos[0], cpos[1], open)
+            } else {
+                Hover::None
+            };
+            let shown = match hover {
+                Hover::Theme(th) if open => th,
+                _ => cur,
+            };
+            let palette = blend.at(shown, t);
+            let current = crate::layout::current_area(&board, &cam, LW, LH, &|s, c| {
+                f.advance(s.face(), c, s.size())
+            });
+            let scene = Scene {
+                board: &board,
+                editor: &editor,
+                theme: cur,
+                palette: Some(palette),
+                background: &bg,
+                wallpaper: None,
+                overlay: &ov,
+                current_area: current,
+                show_help: false,
+                detail: None,
+                name_box: None,
+                theme_open: open,
+                hover,
+                text_bar: None,
+            };
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            draw(&mut buf, w, h, &cam, scale, &scene, &mut f);
+
+            // Captions, title and cursor on top.
+            {
+                let v = View {
+                    cam,
+                    z: z * scale as f32,
+                    scale: scale as f32,
+                    w,
+                    h,
+                };
+                let mut pm = PixmapMut::from_bytes(&mut buf, w, h).unwrap();
+                for (a, b, text) in caps {
+                    let al = ss((t - a) / 0.35).min(ss((b - t) / 0.35));
+                    caption(&mut pm, &v, &mut f, text, al, 775.0, 15.0, true);
+                }
+                let title_a = ss(t / 0.5).min(ss((3.2 - t) / 0.5));
+                caption(&mut pm, &v, &mut f, "wallboard", title_a, 85.0, 34.0, true);
+                if t > 9.0 && t < tour_end + 0.8 {
+                    let fade = ss((t - 9.0) / 0.4).min(ss((tour_end + 0.8 - t) / 0.4));
+                    if fade > 0.5 {
+                        cursor(&mut pm, scale as f32, cpos[0], cpos[1]);
+                    }
+                }
+            }
+            for p in buf.as_chunks_mut::<4>().0 {
+                *p = [p[2], p[1], p[0], 255];
+            }
+            let pm = Pixmap::from_vec(buf, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap();
+            pm.save_png(dir.join(format!("f_{fr:04}.png"))).unwrap();
+        }
+        println!("wrote {frames} frames to {}", dir.display());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // "System" reel: wallboard as the desktop wallpaper, apps tiling over it. Windows are
+    // drawn mock-ups (no real screen contents are captured).
+    // ---------------------------------------------------------------------------------------
+
+    const DW: f32 = 1280.0;
+    const DH: f32 = 720.0;
+    const SDUR: f32 = 26.0;
+
+    fn rrect(pm: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb, a: u8) {
+        if let Some(p) = rounded_rect(x, y, w, h, r) {
+            pm.fill_path(
+                &p,
+                &paint(c, a, true),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    fn ring(pm: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb, width: f32) {
+        if let Some(p) = rounded_rect(x, y, w, h, r) {
+            let st = SkStroke {
+                width,
+                ..SkStroke::default()
+            };
+            pm.stroke_path(&p, &paint(c, 0xff, true), &st, Transform::identity(), None);
+        }
+    }
+
+    fn dot(pm: &mut PixmapMut, x: f32, y: f32, r: f32, c: Rgb) {
+        if let Some(p) = PathBuilder::from_circle(x, y, r) {
+            pm.fill_path(
+                &p,
+                &paint(c, 0xff, true),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    /// Window rect (logical px) for a column, sliding in/out with progress `p` (0 = away, 1 = in).
+    fn win_rect(right: bool, p: f32) -> (f32, f32, f32, f32) {
+        let (w, y, h) = ((DW - 24.0) / 2.0, 46.0, DH - 46.0 - 12.0);
+        let x = if right {
+            let to = 12.0 + w + 8.0;
+            DW + 20.0 + (to - DW - 20.0) * ss(p)
+        } else {
+            let to = 12.0;
+            -w - 20.0 + (to + w + 20.0) * ss(p)
+        };
+        (x, y, w - 4.0, h)
+    }
+
+    fn window_shadow(pm: &mut PixmapMut, s: f32, r: (f32, f32, f32, f32)) {
+        rrect(
+            pm,
+            (r.0 - 4.0) * s,
+            (r.1 + 6.0) * s,
+            (r.2 + 8.0) * s,
+            (r.3 + 4.0) * s,
+            16.0 * s,
+            (0, 0, 0),
+            90,
+        );
+        rrect(
+            pm,
+            (r.0 - 10.0) * s,
+            (r.1 + 2.0) * s,
+            (r.2 + 20.0) * s,
+            (r.3 + 18.0) * s,
+            22.0 * s,
+            (0, 0, 0),
+            36,
+        );
+    }
+
+    fn draw_browser(
+        pm: &mut PixmapMut,
+        v: &View,
+        fonts: &mut Fonts,
+        r: (f32, f32, f32, f32),
+        t_open: f32,
+        focused: bool,
+    ) {
+        let s = v.scale;
+        window_shadow(pm, s, r);
+        let (x, y, w, h) = (r.0 * s, r.1 * s, r.2 * s, r.3 * s);
+        rrect(pm, x, y, w, h, 12.0 * s, (247, 247, 250), 0xff);
+        rrect(pm, x, y, w, 44.0 * s, 12.0 * s, (231, 231, 237), 0xff);
+        rrect(pm, x, y + 30.0 * s, w, 14.0 * s, 0.0, (231, 231, 237), 0xff);
+        for (i, c) in [(255, 95, 87), (254, 188, 46), (40, 200, 64)]
+            .iter()
+            .enumerate()
+        {
+            dot(
+                pm,
+                x + (22.0 + i as f32 * 20.0) * s,
+                y + 22.0 * s,
+                5.5 * s,
+                *c,
+            );
+        }
+        rrect(
+            pm,
+            x + 100.0 * s,
+            y + 9.0 * s,
+            w - 130.0 * s,
+            26.0 * s,
+            13.0 * s,
+            (255, 255, 255),
+            0xff,
+        );
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Regular,
+            12.5 * s,
+            x + 118.0 * s,
+            y + 22.0 * s,
+            "localhost:3000/dashboard",
+            (110, 110, 120),
+            (0.0, v.w as f32),
+            false,
+        );
+        // Page: heading, copy, three stat cards, a growing bar chart.
+        rrect(
+            pm,
+            x + 28.0 * s,
+            y + 72.0 * s,
+            210.0 * s,
+            24.0 * s,
+            8.0 * s,
+            (30, 30, 40),
+            0xff,
+        );
+        for (i, wd) in [0.8_f32, 0.62, 0.7].iter().enumerate() {
+            rrect(
+                pm,
+                x + 28.0 * s,
+                (y + 114.0 + i as f32 * 20.0 * 1.0) * s,
+                (w / s - 56.0) * wd * s,
+                9.0 * s,
+                4.5 * s,
+                (206, 206, 214),
+                0xff,
+            );
+        }
+        let cw = (w / s - 56.0 - 24.0) / 3.0;
+        for (i, c) in [(10u8, 132u8, 255u8), (48, 209, 88), (255, 159, 10)]
+            .iter()
+            .enumerate()
+        {
+            let cx = x + (28.0 + i as f32 * (cw + 12.0)) * s;
+            rrect(
+                pm,
+                cx,
+                y + 190.0 * s,
+                cw * s,
+                92.0 * s,
+                12.0 * s,
+                (255, 255, 255),
+                0xff,
+            );
+            rrect(
+                pm,
+                cx + 14.0 * s,
+                y + 204.0 * s,
+                44.0 * s,
+                10.0 * s,
+                5.0 * s,
+                *c,
+                0xff,
+            );
+            rrect(
+                pm,
+                cx + 14.0 * s,
+                y + 232.0 * s,
+                (cw - 40.0) * s,
+                20.0 * s,
+                6.0 * s,
+                (30, 30, 40),
+                0xff,
+            );
+        }
+        let g = ss(t_open);
+        let bars = [0.45_f32, 0.7, 0.55, 0.9, 0.65, 0.8, 0.5, 0.95, 0.72];
+        let bw = (w / s - 56.0) / bars.len() as f32;
+        for (i, b) in bars.iter().enumerate() {
+            let bh = 150.0 * b * g;
+            rrect(
+                pm,
+                x + (28.0 + i as f32 * bw) * s,
+                y + (h / s - 28.0 - bh) * s,
+                (bw - 8.0) * s,
+                bh * s,
+                6.0 * s,
+                (10, 132, 255),
+                0xff,
+            );
+        }
+        if focused {
+            ring(pm, x, y, w, h, 12.0 * s, (10, 132, 255), 2.2 * s);
+        }
+    }
+
+    fn draw_terminal(
+        pm: &mut PixmapMut,
+        v: &View,
+        fonts: &mut Fonts,
+        r: (f32, f32, f32, f32),
+        typed: usize,
+        focused: bool,
+        blink: bool,
+    ) {
+        let s = v.scale;
+        window_shadow(pm, s, r);
+        let (x, y, w, h) = (r.0 * s, r.1 * s, r.2 * s, r.3 * s);
+        rrect(pm, x, y, w, h, 12.0 * s, (22, 22, 30), 0xff);
+        let lines: [(&str, Rgb); 8] = [
+            ("$ cargo build --release", (235, 235, 245)),
+            ("   Compiling wallboard v0.1.0", (150, 150, 170)),
+            ("    Finished `release` profile [optimized]", (48, 209, 88)),
+            ("$ ./wallboard", (235, 235, 245)),
+            ("  backed up to a private repo", (150, 150, 170)),
+            ("$ git push origin main", (235, 235, 245)),
+            ("  main -> main", (150, 150, 170)),
+            ("$ ", (235, 235, 245)),
+        ];
+        let mut left = typed;
+        let mut last = (0.0, 0.0);
+        for (i, (txt, col)) in lines.iter().enumerate() {
+            let n = txt.chars().count();
+            let show = left.min(n);
+            let part: String = txt.chars().take(show).collect();
+            let cy = y + (30.0 + i as f32 * 26.0) * s;
+            let mut tx = x + 22.0 * s;
+            if part.starts_with("$ ") {
+                tx += text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Bold,
+                    14.5 * s,
+                    tx,
+                    cy,
+                    "$ ",
+                    (48, 209, 88),
+                    (0.0, v.w as f32),
+                    false,
+                );
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Regular,
+                    14.5 * s,
+                    tx,
+                    cy,
+                    &part[2..],
+                    *col,
+                    (0.0, v.w as f32),
+                    false,
+                );
+            } else {
+                text_px(
+                    pm,
+                    v,
+                    fonts,
+                    Face::Regular,
+                    14.5 * s,
+                    tx,
+                    cy,
+                    &part,
+                    *col,
+                    (0.0, v.w as f32),
+                    false,
+                );
+            }
+            last = (tx + fonts.text_width(Face::Regular, &part, 14.5 * s), cy);
+            if left <= n {
+                break;
+            }
+            left -= n;
+        }
+        if blink {
+            rrect(
+                pm,
+                last.0 + 4.0 * s,
+                last.1 - 9.0 * s,
+                8.0 * s,
+                18.0 * s,
+                1.0,
+                (235, 235, 245),
+                0xff,
+            );
+        }
+        if focused {
+            ring(pm, x, y, w, h, 12.0 * s, (10, 132, 255), 2.2 * s);
+        }
+    }
+
+    /// A shell bar on niri's top layer: workspaces left, clock centre, status right.
+    fn draw_bar(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, ws_active: usize) {
+        let s = v.scale;
+        rrect(pm, 0.0, 0.0, v.w as f32, 32.0 * s, 0.0, (14, 14, 20), 238);
+        for i in 0..3 {
+            let cx = (18.0 + i as f32 * 22.0) * s;
+            if i == ws_active {
+                rrect(
+                    pm,
+                    cx - 9.0 * s,
+                    12.0 * s,
+                    24.0 * s,
+                    8.0 * s,
+                    4.0 * s,
+                    (240, 240, 250),
+                    0xff,
+                );
+            } else {
+                dot(pm, cx + 3.0 * s, 16.0 * s, 4.0 * s, (95, 95, 112));
+            }
+        }
+        let clock = "Thu 9:41";
+        let tw = fonts.text_width(Face::Bold, clock, 14.0 * s);
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Bold,
+            14.0 * s,
+            (v.w as f32 - tw) / 2.0,
+            16.0 * s,
+            clock,
+            (240, 240, 250),
+            (0.0, v.w as f32),
+            false,
+        );
+        let tx = v.w as f32 - 150.0 * s;
+        for i in 0..3 {
+            dot(
+                pm,
+                tx + i as f32 * 16.0 * s,
+                16.0 * s,
+                4.5 * s,
+                (150, 150, 170),
+            );
+        }
+        text_px(
+            pm,
+            v,
+            fonts,
+            Face::Regular,
+            13.0 * s,
+            tx + 58.0 * s,
+            16.0 * s,
+            "87%",
+            (200, 200, 214),
+            (0.0, v.w as f32),
+            false,
+        );
+        rrect(
+            pm,
+            tx + 92.0 * s,
+            10.0 * s,
+            28.0 * s,
+            12.0 * s,
+            3.0 * s,
+            (48, 209, 88),
+            0xff,
+        );
+    }
+
+    fn headline(pm: &mut PixmapMut, v: &View, fonts: &mut Fonts, l1: &str, l2: &str, a: f32) {
+        if a <= 0.01 {
+            return;
+        }
+        let bg = (12, 12, 22);
+        for (i, (txt, col)) in [(l1, (255, 255, 255)), (l2, (150, 178, 255))]
+            .iter()
+            .enumerate()
+        {
+            let px = 66.0;
+            let tw = fonts.text_width(Face::Bold, txt, px);
+            let x = (v.w as f32 - tw) / 2.0;
+            text_px(
+                pm,
+                v,
+                fonts,
+                Face::Bold,
+                px,
+                x,
+                440.0 + i as f32 * 86.0 + (1.0 - a) * 14.0,
+                txt,
+                mix(bg, *col, a),
+                (0.0, v.w as f32),
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn demo_system_video() {
+        let Some(dir) = std::env::var_os("WB_DEMO2") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = Fonts::load().unwrap().0;
+        let ds = 2u32;
+        let (dw, dh) = ((DW as u32) * ds, (DH as u32) * ds);
+        let (fw, fh) = (1080u32, 1920u32);
+        let editor = Editor::new();
+        let bg = Background::default();
+        let margins = Margins { top: 56.0 };
+
+        let b_final = board_at(SDUR + 5.0, &f, true);
+        let adv = |s: Style, ch: char| f.advance(s.face(), ch, s.size());
+        let bottom = b_final
+            .areas
+            .iter()
+            .map(|a| area_geom(a, &adv).card.bottom())
+            .fold(0.0, f32::max);
+        let board_w = 1096.0_f32;
+        let z_board = (590.0 / bottom).min(1.0);
+        let cam = Camera {
+            x: board_w / 2.0 - DW / 2.0 / z_board,
+            y: (bottom / 2.0 + 24.0 / z_board) - DH / 2.0 / z_board,
+            zoom: z_board,
+        };
+        let focus_card = area_geom(&b_final.areas[1], &adv);
+        let to_screen = |wx: f32, wy: f32| ((wx - cam.x) * z_board, (wy - cam.y) * z_board);
+        let focus_c = to_screen(
+            focus_card.card.x + focus_card.card.w / 2.0,
+            focus_card.card.y + focus_card.card.h / 2.0,
+        );
+        let ship_circle = {
+            let c = focus_card.rows[0].circle;
+            to_screen(c.x + c.w / 2.0, c.y + c.h / 2.0)
+        };
+
+        let ov0 = {
+            let ff: &Fonts = &f;
+            overlay(&b_final, DW, DH, margins, &|s, t| {
+                ff.text_width(s.face(), t, s.size())
+            })
+        };
+        let centre = |r: LRect| (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let theme_btn = centre(
+            ov0.view_btns
+                .iter()
+                .find(|(b, _)| *b == ViewBtn::Theme)
+                .unwrap()
+                .1,
+        );
+        let row = |t: Theme| centre(ov0.theme_items.iter().find(|(x, _)| *x == t).unwrap().1);
+        let (r_neon, r_paper, r_aurora) = (row(Theme::Neon), row(Theme::Paper), row(Theme::Aurora));
+
+        let ck: Vec<(f32, [f32; 2])> = vec![
+            (0.0, [1000.0, 640.0]),
+            (2.0, [1000.0, 640.0]),
+            (4.7, [ship_circle.0, ship_circle.1]),
+            (5.6, [ship_circle.0, ship_circle.1]),
+            (6.8, [760.0, 600.0]),
+            (17.2, [760.0, 600.0]),
+            (18.4, [theme_btn.0, theme_btn.1]),
+            (19.5, [r_neon.0, r_neon.1]),
+            (20.4, [r_neon.0 + 2.0, r_neon.1 + 2.0]),
+            (20.8, [r_paper.0, r_paper.1]),
+            (21.6, [r_paper.0 + 2.0, r_paper.1 + 2.0]),
+            (22.0, [r_aurora.0, r_aurora.1]),
+            (22.9, [r_aurora.0 + 2.0, r_aurora.1 + 2.0]),
+            (23.7, [760.0, 640.0]),
+        ];
+        let (open_at, close_at) = (18.6_f32, 23.2_f32);
+
+        let mut blend = Blend {
+            from: colors(Theme::Dark),
+            to: Theme::Dark,
+            t0: -10.0,
+        };
+        let heads: [(f32, f32, &str, &str); 5] = [
+            (0.2, 7.6, "Your wallpaper", "is your productivity app"),
+            (8.0, 14.8, "Open an app.", "It tiles right over it."),
+            (15.1, 17.9, "Close it.", "Your board is back."),
+            (18.1, 23.7, "Make it yours.", "7 live themes."),
+            (24.0, SDUR, "wallboard", "your desktop, finally useful"),
+        ];
+        let subs: [(f32, f32, &str); 5] = [
+            (0.4, 7.6, "A life-OS board on niri's background layer"),
+            (
+                8.2,
+                14.8,
+                "Browser, terminal, anything: windows tile on top",
+            ),
+            (15.3, 17.9, "Every empty workspace is your home screen"),
+            (18.3, 23.7, "Hover a theme to preview it live"),
+            (24.2, SDUR, "Rust · ~15 MB RAM · CPU-rendered"),
+        ];
+        // Composite camera: (zoom, centre x, centre y) in desktop-buffer px.
+        let (fcx, fcy) = (focus_c.0 * 2.0, focus_c.1 * 2.0);
+        let zk: Vec<(f32, [f32; 3])> = vec![
+            (0.0, [1.0, 1280.0, 720.0]),
+            (1.6, [1.0, 1280.0, 720.0]),
+            (2.6, [1.7, fcx, fcy]),
+            (7.0, [1.7, fcx, fcy]),
+            (8.0, [1.0, 1280.0, 720.0]),
+            (17.6, [1.0, 1280.0, 720.0]),
+            (18.6, [1.3, 1700.0, 800.0]),
+            (23.2, [1.3, 1700.0, 800.0]),
+            (24.2, [1.0, 1280.0, 720.0]),
+        ];
+
+        let frames = (SDUR * FPS) as usize;
+        for fr in 0..frames {
+            let t = fr as f32 / FPS;
+            let board = board_at(t + 0.9, &f, true);
+            let cpos = keys(&ck, t);
+            let cursor_on = t < 7.6 || (t > 17.0 && t < 24.2);
+            let open = t >= open_at && t < close_at;
+            let cur = if t >= 22.4 {
+                Theme::Aurora
+            } else {
+                Theme::Dark
+            };
+            let ov = {
+                let ff: &Fonts = &f;
+                overlay(&board, DW, DH, margins, &|s, t| {
+                    ff.text_width(s.face(), t, s.size())
+                })
+            };
+            let hover = if cursor_on && t > 17.0 {
+                ov.hover_at(cpos[0], cpos[1], open)
+            } else {
+                Hover::None
+            };
+            let shown = match hover {
+                Hover::Theme(th) if open => th,
+                _ => cur,
+            };
+            let palette = blend.at(shown, t);
+            let current = crate::layout::current_area(&board, &cam, DW, DH, &|s, c| {
+                f.advance(s.face(), c, s.size())
+            });
+            let scene = Scene {
+                board: &board,
+                editor: &editor,
+                theme: cur,
+                palette: Some(palette),
+                background: &bg,
+                wallpaper: None,
+                overlay: &ov,
+                current_area: current,
+                show_help: false,
+                detail: None,
+                name_box: None,
+                theme_open: open,
+                hover,
+                text_bar: None,
+            };
+            let mut dbuf = vec![0u8; (dw * dh * 4) as usize];
+            draw(&mut dbuf, dw, dh, &cam, ds, &scene, &mut f);
+
+            // Windows (above the background-layer board), then the top-layer bar, then cursor.
+            {
+                let v = View {
+                    cam,
+                    z: z_board * ds as f32,
+                    scale: ds as f32,
+                    w: dw,
+                    h: dh,
+                };
+                let mut pm = PixmapMut::from_bytes(&mut dbuf, dw, dh).unwrap();
+                let p_term = ss((t - 8.0) / 1.3).min(1.0 - ss((t - 15.4) / 1.2));
+                let p_brow = ss((t - 9.6) / 1.3).min(1.0 - ss((t - 14.2) / 1.2));
+                if p_term > 0.001 {
+                    let typed = (((t - 9.3).max(0.0)) * 38.0) as usize;
+                    draw_terminal(
+                        &mut pm,
+                        &v,
+                        &mut f,
+                        win_rect(true, p_term),
+                        typed,
+                        p_brow < 0.5,
+                        ((t * 2.0) as i32) % 2 == 0,
+                    );
+                }
+                if p_brow > 0.001 {
+                    draw_browser(
+                        &mut pm,
+                        &v,
+                        &mut f,
+                        win_rect(false, p_brow),
+                        (t - 10.9) / 1.4,
+                        true,
+                    );
+                }
+                draw_bar(&mut pm, &v, &mut f, 0);
+                if cursor_on {
+                    cursor(&mut pm, ds as f32, cpos[0], cpos[1]);
+                }
+            }
+
+            // Final 1080x1920 composite.
+            let mut fb = vec![0u8; (fw * fh * 4) as usize];
+            {
+                let vf = View {
+                    cam: Camera {
+                        x: 0.0,
+                        y: 0.0,
+                        zoom: 1.0,
+                    },
+                    z: 1.0,
+                    scale: 1.0,
+                    w: fw,
+                    h: fh,
+                };
+                let mut pm = PixmapMut::from_bytes(&mut fb, fw, fh).unwrap();
+                let (r, g, b) = bgr((10, 10, 20));
+                pm.fill(Color::from_rgba8(r, g, b, 0xff));
+                draw_aurora(
+                    &mut pm,
+                    &vf,
+                    [(0x2d, 0x5b, 0xff), (0x9b, 0x3d, 0xff), (0x00, 0xd4, 0xb4)],
+                );
+
+                let (sx, sy, sw, sh) = (20.0_f32, 770.0_f32, 1040.0_f32, 585.0_f32);
+                rrect(
+                    &mut pm,
+                    sx - 10.0,
+                    sy + 6.0,
+                    sw + 20.0,
+                    sh + 22.0,
+                    30.0,
+                    (0, 0, 0),
+                    120,
+                );
+                rrect(
+                    &mut pm,
+                    sx - 8.0,
+                    sy - 8.0,
+                    sw + 16.0,
+                    sh + 16.0,
+                    28.0,
+                    (30, 30, 38),
+                    0xff,
+                );
+                ring(
+                    &mut pm,
+                    sx - 8.0,
+                    sy - 8.0,
+                    sw + 16.0,
+                    sh + 16.0,
+                    28.0,
+                    (70, 70, 86),
+                    1.5,
+                );
+                let z = keys(&zk, t);
+                let (kz, mut cx, mut cy) = (z[0], z[1], z[2]);
+                let half_w = dw as f32 / 2.0 / kz;
+                let half_h = dh as f32 / 2.0 / kz;
+                cx = cx.clamp(half_w, dw as f32 - half_w);
+                cy = cy.clamp(half_h, dh as f32 - half_h);
+                let sc = sw / dw as f32 * kz;
+                let tf = Transform::from_row(
+                    sc,
+                    0.0,
+                    0.0,
+                    sc,
+                    sx + sw / 2.0 - cx * sc,
+                    sy + sh / 2.0 - cy * sc,
+                );
+                let dpm =
+                    Pixmap::from_vec(dbuf, tiny_skia::IntSize::from_wh(dw, dh).unwrap()).unwrap();
+                let mut paint_p = Paint::default();
+                paint_p.shader = tiny_skia::Pattern::new(
+                    dpm.as_ref(),
+                    tiny_skia::SpreadMode::Pad,
+                    FilterQuality::Bicubic,
+                    1.0,
+                    tf,
+                );
+                paint_p.anti_alias = true;
+                if let Some(p) = rounded_rect(sx, sy, sw, sh, 20.0) {
+                    pm.fill_path(&p, &paint_p, FillRule::Winding, Transform::identity(), None);
+                }
+                for (a, b, l1, l2) in heads {
+                    let al = ss((t - a) / 0.4).min(ss((b - t) / 0.4));
+                    headline(&mut pm, &vf, &mut f, l1, l2, al);
+                }
+                for (a, b, text) in subs {
+                    let al = ss((t - a) / 0.4).min(ss((b - t) / 0.4));
+                    caption(&mut pm, &vf, &mut f, text, al, 1470.0, 25.0, false);
+                }
+            }
+            for p in fb.as_chunks_mut::<4>().0 {
+                *p = [p[2], p[1], p[0], 255];
+            }
+            let pm = Pixmap::from_vec(fb, tiny_skia::IntSize::from_wh(fw, fh).unwrap()).unwrap();
+            pm.save_png(dir.join(format!("s_{fr:04}.png"))).unwrap();
+        }
+        println!("wrote {frames} frames to {}", dir.display());
     }
 }

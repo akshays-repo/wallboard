@@ -6,7 +6,9 @@
 //! - A file that cannot be used (corrupt, unknown version) is moved to `board.json.bad`
 //!   (or `.bad.1`, `.bad.2`, ... if one exists) and never overwritten; the app starts fresh.
 
-use crate::board::{Area, Background, Board, Connector, Note, Shape, Stroke, TextBox, Theme};
+use crate::board::{
+    Area, Background, Board, Connector, Note, Shape, Space, Stroke, TextBox, Theme,
+};
 use crate::camera::Camera;
 use crate::layout::Margins;
 use crate::sync::BackupSettings;
@@ -45,6 +47,8 @@ struct FileData {
     #[serde(default)]
     connectors: Vec<Connector>,
     #[serde(default)]
+    spaces: Vec<Space>,
+    #[serde(default)]
     next_id: u64,
     #[serde(default)]
     camera: Option<Camera>,
@@ -67,6 +71,7 @@ struct FileRef<'a> {
     texts: &'a [TextBox],
     shapes: &'a [Shape],
     connectors: &'a [Connector],
+    spaces: &'a [Space],
     next_id: u64,
     camera: Option<Camera>,
     theme: Theme,
@@ -135,7 +140,8 @@ pub fn load(path: &Path) -> Loaded {
             }
             Loaded::Ok {
                 board: Board::from_parts(f.areas, f.notes, f.strokes, f.texts, f.shapes, f.next_id)
-                    .with_connectors(f.connectors),
+                    .with_connectors(f.connectors)
+                    .with_spaces(f.spaces),
                 view: View {
                     camera: f.camera.filter(Camera::is_valid),
                     theme: f.theme,
@@ -186,6 +192,7 @@ pub fn save(path: &Path, board: &Board, view: &View) -> std::io::Result<()> {
         texts: &board.texts,
         shapes: &board.shapes,
         connectors: &board.connectors,
+        spaces: &board.spaces,
         next_id: board.next_id(),
         camera: view.camera,
         theme: view.theme,
@@ -214,6 +221,7 @@ pub fn content_hash(board: &Board) -> u64 {
         texts: &'a [TextBox],
         shapes: &'a [Shape],
         connectors: &'a [Connector],
+        spaces: &'a [Space],
     }
     let json = serde_json::to_string(&C {
         areas: &board.areas,
@@ -222,6 +230,7 @@ pub fn content_hash(board: &Board) -> u64 {
         texts: &board.texts,
         shapes: &board.shapes,
         connectors: &board.connectors,
+        spaces: &board.spaces,
     })
     .unwrap_or_default();
     let mut h = DefaultHasher::new();
@@ -248,6 +257,7 @@ mod tests {
             done: true,
             priority: 3,
             body: Some("details\nmore".into()),
+            due: None,
         });
         let n = b.add_note(1.0, 2.0);
         b.note_mut(n).unwrap().title = "héllo".into();
@@ -532,6 +542,12 @@ mod tests {
         b.note_mut(n).unwrap().w = 333.0;
         let t = b.add_text(7.0, 8.0);
         b.text_mut(t).unwrap().text = "free\ntext".into();
+        {
+            let tb = b.text_mut(t).unwrap();
+            tb.size = crate::board::TextSize::Title;
+            (tb.bold, tb.italic, tb.underline, tb.strike, tb.plain, tb.color) =
+                (true, true, true, true, true, 4);
+        }
         let sh = b.add_shape(crate::board::ShapeKind::Ellipse, 1.0, 2.0);
         b.shape_mut(sh).unwrap().x2 = 90.0;
         b.shape_mut(sh).unwrap().y2 = 70.0;
@@ -551,6 +567,25 @@ mod tests {
             c.areas[2].w = 480.0;
             content_hash(&c)
         });
+    }
+
+    #[test]
+    fn spaces_survive_a_save_and_load_and_old_files_have_none() {
+        let dir = tmpdir("spaces");
+        let path = dir.join("board.json");
+        let mut b = Board::default_board();
+        b.add_space("Docs", 12.5, -40.0, 1.25);
+        save(&path, &b, &View::default()).unwrap();
+        match load(&path) {
+            Loaded::Ok { board, .. } => assert_eq!(board.spaces, b.spaces),
+            _ => panic!("load failed"),
+        }
+        assert_ne!(content_hash(&b), content_hash(&Board::default_board()));
+        fs::write(&path, r#"{"version":2,"areas":[]}"#).unwrap();
+        match load(&path) {
+            Loaded::Ok { board, .. } => assert!(board.spaces.is_empty()),
+            _ => panic!("old file"),
+        }
     }
 
     #[test]

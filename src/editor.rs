@@ -6,8 +6,8 @@ use crate::board::{Board, End, History, ShapeKind, Todo, DEFAULT_SHAPE};
 use crate::board::{MAX_W, MIN_AREA_W, MIN_NOTE_W};
 use crate::camera::Camera;
 use crate::layout::{
-    area_geom, hit_handle, hit_test, item_at, note_geom, text_geom, Adv, Handle, Sel, Target, Tool,
-    TEXT_LINE_H,
+    area_geom, hit_handle, hit_test, item_at, note_geom, text_geom, Adv, FmtBtn, Handle, Sel,
+    Target, Tool,
 };
 use crate::text::{index_at_x, line_of, Style};
 
@@ -126,6 +126,14 @@ enum Drag {
     Pan {
         last: (f32, f32),
     },
+    /// Rubber-band selection on empty canvas: world start and current corner, plus the screen
+    /// start (a tiny drag is just a click that deselects).
+    Marquee {
+        start: (f32, f32),
+        cur: (f32, f32),
+        screen: (f32, f32),
+        moved: bool,
+    },
     /// Pressed on a card/note title: becomes a move past the threshold. For notes, releasing
     /// without moving starts editing the title.
     Pending {
@@ -243,7 +251,9 @@ pub fn style_of(board: &Board, t: EditTarget) -> Style {
         EditTarget::TodoBody(..) => Style::Chip,
         EditTarget::NoteTitle(_) => Style::Title,
         EditTarget::NoteBody(_) => Style::Row,
-        EditTarget::FreeText(_) => Style::Free,
+        EditTarget::FreeText(id) => board
+            .text(id)
+            .map_or(Style::Free(Default::default(), false), |t| t.style()),
     }
 }
 
@@ -285,6 +295,12 @@ impl Editor {
 
     pub fn is_dragging(&self) -> bool {
         !matches!(self.drag, Drag::None)
+    }
+
+    /// Record that something outside the editor (the todo detail page) changed the board.
+    pub fn board_changed_externally(&mut self, board: &Board) {
+        self.history.record(board, None);
+        self.modified = true;
     }
 
     /// True once after any change to saved content.
@@ -519,6 +535,35 @@ impl Editor {
     }
 
     /// Append an empty todo to area `ai` and edit it. False if the hero area is full.
+    /// Save the view as a space (undoable). Returns its id.
+    pub fn add_space(&mut self, board: &mut Board, name: &str, c: (f32, f32), zoom: f32) -> u64 {
+        self.history.record(board, None);
+        self.modified = true;
+        board.add_space(name, c.0, c.1, zoom)
+    }
+
+    pub fn rename_space(&mut self, board: &mut Board, id: u64, name: &str) -> bool {
+        if board.space(id).is_none_or(|s| s.name == name) {
+            return false;
+        }
+        self.history.record(board, None);
+        if let Some(s) = board.space_mut(id) {
+            s.name = name.to_string();
+        }
+        self.modified = true;
+        true
+    }
+
+    pub fn delete_space(&mut self, board: &mut Board, id: u64) -> bool {
+        if board.space(id).is_none() {
+            return false;
+        }
+        self.history.record(board, None);
+        board.spaces.retain(|s| s.id != id);
+        self.modified = true;
+        true
+    }
+
     pub fn add_todo(&mut self, board: &mut Board, ai: usize) -> bool {
         let Some(a) = board.areas.get(ai) else {
             return false;
@@ -1032,28 +1077,36 @@ impl Editor {
         true
     }
 
-    /// Delete key: remove the selected item (a card only if it is empty, like right-click).
+    /// Delete key: remove the selected items (a card only if it is empty, like right-click).
     pub fn delete_selected(&mut self, board: &mut Board) -> bool {
-        let Some(sel) = self.selected else {
+        let Some(first) = self.selected else {
             return false;
         };
-        let ok = match sel {
+        let mut items = vec![first];
+        items.extend(self.extra.iter().copied());
+        let removable = |sel: &Sel| match *sel {
             Sel::Area(id) => board.area(id).is_some_and(|a| a.todos.is_empty()),
             _ => true,
         };
-        if !ok {
+        let doomed: Vec<Sel> = items.iter().copied().filter(removable).collect();
+        if doomed.is_empty() {
             return false;
         }
         self.history.record(board, None);
-        match sel {
-            Sel::Area(id) => board.areas.retain(|a| a.id != id),
-            Sel::Note(id) => board.notes.retain(|n| n.id != id),
-            Sel::Shape(id) => board.shapes.retain(|s| s.id != id),
-            Sel::Text(id) => board.texts.retain(|t| t.id != id),
-            Sel::Connector(id) => board.connectors.retain(|c| c.id != id),
+        for sel in &doomed {
+            match *sel {
+                Sel::Area(id) => board.areas.retain(|a| a.id != id),
+                Sel::Note(id) => board.notes.retain(|n| n.id != id),
+                Sel::Shape(id) => board.shapes.retain(|s| s.id != id),
+                Sel::Text(id) => board.texts.retain(|t| t.id != id),
+                Sel::Connector(id) => board.connectors.retain(|c| c.id != id),
+            }
         }
         board.prune_connectors();
-        self.selected = None;
+        // Whatever could not be removed (a card that still has todos) stays selected.
+        let mut kept = items.into_iter().filter(|s| !doomed.contains(s));
+        self.selected = kept.next();
+        self.extra = kept.collect();
         self.modified = true;
         true
     }
@@ -1147,9 +1200,32 @@ impl Editor {
         if double {
             self.create_area_at(board, wx, wy);
         } else {
-            self.drag = Drag::Pan { last: p };
+            self.drag = Drag::Marquee {
+                start: (wx, wy),
+                cur: (wx, wy),
+                screen: p,
+                moved: false,
+            };
         }
         true
+    }
+
+    /// The rubber-band rectangle being dragged, in world coordinates (x, y, w, h).
+    pub fn marquee_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        match self.drag {
+            Drag::Marquee {
+                start,
+                cur,
+                moved: true,
+                ..
+            } => Some((
+                start.0.min(cur.0),
+                start.1.min(cur.1),
+                (start.0 - cur.0).abs(),
+                (start.1 - cur.1).abs(),
+            )),
+            _ => None,
+        }
     }
 
     /// The field a hit would edit, if it is a text target.
@@ -1248,9 +1324,110 @@ impl Editor {
                     return 0;
                 };
                 let g = text_geom(t, adv);
-                caret_in_block(text, &g.lines, g.rect.x, g.rect.y, TEXT_LINE_H, wx, wy, &a)
+                caret_in_block(text, &g.lines, g.rect.x, g.rect.y, g.line_h, wx, wy, &a)
             }
         }
+    }
+
+    /// The free text the format bar and grip belong to: the one being typed, else the only
+    /// selected item if it is a text.
+    pub fn text_focus(&self) -> Option<u64> {
+        if let Some(e) = self.editing {
+            return match e.target {
+                EditTarget::FreeText(id) => Some(id),
+                _ => None,
+            };
+        }
+        match self.selected {
+            Some(Sel::Text(id)) if self.extra.is_empty() => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Apply a format bar button to text `id`. One undo step; true if anything changed.
+    pub fn format_text(&mut self, board: &mut Board, id: u64, btn: FmtBtn) -> bool {
+        let Some(cur) = board.text(id).cloned() else {
+            return false;
+        };
+        let mut t = cur.clone();
+        match btn {
+            FmtBtn::Bold => t.bold = !t.bold,
+            FmtBtn::Italic => t.italic = !t.italic,
+            FmtBtn::Underline => t.underline = !t.underline,
+            FmtBtn::Strike => t.strike = !t.strike,
+            FmtBtn::Size(sz) => t.size = sz,
+            FmtBtn::Color(c) => t.color = c % crate::board::PALETTE_LEN,
+            FmtBtn::Markdown => t.plain = !t.plain,
+        }
+        if t == cur {
+            return false;
+        }
+        self.history.record(board, None);
+        if let Some(dst) = board.text_mut(id) {
+            *dst = t;
+        }
+        self.modified = true;
+        true
+    }
+
+    /// Step the size of text `id` up or down (Ctrl+] / Ctrl+[).
+    pub fn step_text_size(&mut self, board: &mut Board, id: u64, up: bool) -> bool {
+        let Some(sz) = board.text(id).map(|t| t.size.step(up)) else {
+            return false;
+        };
+        self.format_text(board, id, FmtBtn::Size(sz))
+    }
+
+    /// Press on the grip of text `id`: dragging moves it (typing goes on if it was being typed).
+    pub fn grab_text(&mut self, board: &Board, cam: &Camera, p: (f32, f32), id: u64) -> bool {
+        let Some(t) = board.text(id) else {
+            return false;
+        };
+        let (wx, wy) = cam.screen_to_world(p.0, p.1);
+        self.anchor = None;
+        self.drag = Drag::Pending {
+            who: Mover::Text(id),
+            start: p,
+            off: (wx - t.x, wy - t.y),
+        };
+        if self.editing.is_none() {
+            self.selected = Some(Sel::Text(id));
+            self.extra.clear();
+        }
+        true
+    }
+
+    /// Paste a text box at (wx, wy): a copy of `tmpl` (text and style) if given, else plain
+    /// `text`. Selects the new box. Returns its id.
+    pub fn paste_text_box(
+        &mut self,
+        board: &mut Board,
+        tmpl: Option<&crate::board::TextBox>,
+        text: &str,
+        (wx, wy): (f32, f32),
+    ) -> u64 {
+        self.finish_edit(board);
+        self.history.record(board, None);
+        let (mut x, mut y) = (wx, wy);
+        // Pasting twice at the same spot staggers the copies instead of stacking them.
+        while board.texts.iter().any(|t| (t.x - x).abs() < 1.0 && (t.y - y).abs() < 1.0) {
+            (x, y) = (x + 24.0, y + 24.0);
+        }
+        let id = match tmpl {
+            Some(t) => board.add_text_like(t, x, y),
+            None => {
+                let id = board.add_text(x, y);
+                if let Some(t) = board.text_mut(id) {
+                    t.text = text.to_string();
+                }
+                id
+            }
+        };
+        self.tool = Tool::Select;
+        self.selected = Some(Sel::Text(id));
+        self.extra.clear();
+        self.modified = true;
+        id
     }
 
     /// Pointer moved while drag-selecting text: the caret follows it. True if it moved.
@@ -1275,6 +1452,21 @@ impl Editor {
                 self.drag = Drag::Pan { last: p };
                 self.view_changed = true;
                 true
+            }
+            Drag::Marquee {
+                start,
+                screen,
+                moved,
+                ..
+            } => {
+                let moved = moved || (p.0 - screen.0).hypot(p.1 - screen.1) >= DRAG_THRESHOLD;
+                self.drag = Drag::Marquee {
+                    start,
+                    cur: (wx, wy),
+                    screen,
+                    moved,
+                };
+                moved
             }
             Drag::Pending { who, start, off } => {
                 if (p.0 - start.0).hypot(p.1 - start.1) < DRAG_THRESHOLD {
@@ -1478,6 +1670,11 @@ impl Editor {
                 who: Mover::Text(id),
                 ..
             } => {
+                let t = EditTarget::FreeText(id);
+                if self.editing.is_some_and(|e| e.target == t) {
+                    // A click on the grip of the text being typed: keep the caret where it is.
+                    return false;
+                }
                 if board.text(id).is_some() {
                     self.start_editing_end(board, EditTarget::FreeText(id));
                     return true;
@@ -1556,6 +1753,23 @@ impl Editor {
                         }
                     }
                 }
+                true
+            }
+            Drag::Marquee {
+                start,
+                cur,
+                moved: true,
+                ..
+            } => {
+                let r = crate::layout::Rect::new(
+                    start.0.min(cur.0),
+                    start.1.min(cur.1),
+                    (start.0 - cur.0).abs(),
+                    (start.1 - cur.1).abs(),
+                );
+                let mut items = crate::layout::items_in_rect(board, r, adv).into_iter();
+                self.selected = items.next();
+                self.extra = items.collect();
                 true
             }
             Drag::Resize { .. } => true,
@@ -2171,14 +2385,94 @@ mod tests {
     }
 
     #[test]
-    fn dragging_empty_space_pans_the_camera() {
+    fn middle_dragging_empty_space_pans_the_camera() {
         let (mut e, mut b) = (Editor::new(), Board::new());
         let mut c = cam();
-        e.press(&mut b, &c, (400.0, 400.0), Button::Left, 0, A);
+        e.press(&mut b, &c, (400.0, 400.0), Button::Middle, 0, A);
         e.motion(&mut b, &mut c, (450.0, 430.0));
         e.release(&mut b, A);
         assert_eq!((c.x, c.y), (-50.0, -30.0), "content follows the pointer");
         assert!(e.take_view_changed() && !e.take_modified());
+    }
+
+    fn two_empty_areas() -> (Editor, Board, u64, u64) {
+        let mut b = Board::new();
+        let a1 = b.add_area(100.0, 100.0);
+        let a2 = b.add_area(600.0, 100.0);
+        (Editor::new(), b, a1, a2)
+    }
+
+    #[test]
+    fn dragging_empty_space_selects_what_the_box_touches() {
+        let (mut e, mut b, a1, a2) = two_empty_areas();
+        let mut c = cam();
+        e.press(&mut b, &c, (20.0, 20.0), Button::Left, 0, A);
+        e.motion(&mut b, &mut c, (500.0, 140.0));
+        assert!(
+            e.marquee_rect().is_some(),
+            "rubber band is shown while dragging"
+        );
+        e.release(&mut b, A);
+        assert!(e.marquee_rect().is_none());
+        assert_eq!(e.selected, Some(Sel::Area(a1)));
+        assert!(e.extra.is_empty(), "the second card is outside the box");
+        assert_eq!((c.x, c.y), (0.0, 0.0), "selecting does not pan");
+
+        e.press(&mut b, &c, (20.0, 20.0), Button::Left, 5000, A);
+        e.motion(&mut b, &mut c, (1100.0, 140.0));
+        e.release(&mut b, A);
+        let mut all = vec![e.selected.unwrap()];
+        all.extend(e.extra.iter().copied());
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&Sel::Area(a1)) && all.contains(&Sel::Area(a2)));
+    }
+
+    #[test]
+    fn marquee_selection_can_be_grouped_and_deleted() {
+        let (mut e, mut b, a1, a2) = two_empty_areas();
+        let mut c = cam();
+        e.press(&mut b, &c, (20.0, 20.0), Button::Left, 0, A);
+        e.motion(&mut b, &mut c, (1100.0, 140.0));
+        e.release(&mut b, A);
+        assert!(e.group_selected(&mut b));
+        assert!(b.group_of(Sel::Area(a1)) != 0);
+        assert_eq!(b.group_of(Sel::Area(a1)), b.group_of(Sel::Area(a2)));
+
+        e.press(&mut b, &c, (20.0, 20.0), Button::Left, 1000, A);
+        e.motion(&mut b, &mut c, (1100.0, 140.0));
+        e.release(&mut b, A);
+        assert!(e.delete_selected(&mut b));
+        assert!(b.areas.is_empty() && e.selected.is_none());
+        assert!(
+            e.undo(&mut b) && b.areas.len() == 2,
+            "one undo restores both"
+        );
+    }
+
+    #[test]
+    fn delete_keeps_cards_that_still_have_todos() {
+        let (mut e, mut b) = setup();
+        let n = b.areas.len();
+        let mut c = cam();
+        // a box over the whole board (starting off in the corner)
+        e.press(&mut b, &c, (-500.0, -500.0), Button::Left, 0, A);
+        e.motion(&mut b, &mut c, (5000.0, 5000.0));
+        e.release(&mut b, A);
+        assert!(e.selected.is_some());
+        e.delete_selected(&mut b);
+        assert!(
+            b.areas.iter().any(|a| !a.todos.is_empty()),
+            "non-empty card survives"
+        );
+        assert!(b.areas.len() <= n);
+    }
+
+    #[test]
+    fn a_plain_click_on_empty_space_just_deselects() {
+        let (mut e, mut b, ..) = two_empty_areas();
+        e.selected = Some(Sel::Area(1));
+        click(&mut e, &mut b, (20.0, 20.0), 0);
+        assert!(e.selected.is_none() && e.marquee_rect().is_none());
     }
 
     #[test]
@@ -2372,6 +2666,7 @@ mod tests {
             done: true,
             priority: 0,
             body: None,
+            due: None,
         });
         let circle = area_geom(&b.areas[1], A).rows[3].circle;
         click(&mut e, &mut b, centre(circle), 9000);
@@ -2786,6 +3081,7 @@ mod tests {
                 done: true,
                 priority: 0,
                 body: None,
+                due: None,
             },
         ];
         let circle = area_geom(&b.areas[1], A).rows[3].circle;
@@ -2874,6 +3170,96 @@ mod tests {
         e.key(&mut b, Key::Escape, A);
         e.press(&mut b, &cam(), (110.0, 110.0), Button::Right, 20000, A);
         assert!(b.texts.is_empty());
+    }
+
+    #[test]
+    fn format_bar_styles_the_text_in_one_undo_step_each() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        let id = b.add_text(100.0, 100.0);
+        b.text_mut(id).unwrap().text = "hello".into();
+        assert_eq!(e.text_focus(), None);
+        e.selected = Some(Sel::Text(id));
+        assert_eq!(e.text_focus(), Some(id));
+        assert!(e.format_text(&mut b, id, FmtBtn::Bold));
+        assert!(e.format_text(&mut b, id, FmtBtn::Size(crate::board::TextSize::Title)));
+        assert!(e.format_text(&mut b, id, FmtBtn::Color(3)));
+        assert!(!e.format_text(&mut b, id, FmtBtn::Color(3)), "no-op is not an undo step");
+        let t = b.text(id).unwrap();
+        assert!(t.bold && t.size == crate::board::TextSize::Title && t.color == 3);
+        assert_eq!(t.style(), Style::Free(crate::board::TextSize::Title, true));
+        assert!(e.undo(&mut b));
+        assert_eq!(b.text(id).unwrap().color, 0);
+        assert!(e.step_text_size(&mut b, id, false));
+        assert_eq!(b.text(id).unwrap().size, crate::board::TextSize::Heading);
+        assert!(e.take_modified());
+    }
+
+    #[test]
+    fn the_grip_moves_text_while_typing_and_keeps_the_caret() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        let id = b.add_text(100.0, 100.0);
+        b.text_mut(id).unwrap().text = "drag me".into();
+        let mut c = cam();
+        click(&mut e, &mut b, (110.0, 110.0), 0);
+        e.key(&mut b, Key::Home, A);
+        assert_eq!(e.editing.unwrap().caret, 0);
+        // The grip sits left of the text; a press there drags the box.
+        assert!(e.grab_text(&b, &c, (80.0, 110.0), id));
+        e.motion(&mut b, &mut c, (130.0, 160.0));
+        e.release(&mut b, A);
+        assert_eq!((b.texts[0].x, b.texts[0].y), (150.0, 150.0));
+        let ed = e.editing.expect("still typing");
+        assert_eq!((ed.target, ed.caret), (EditTarget::FreeText(id), 0));
+        assert!(e.undo(&mut b));
+        assert_eq!((b.texts[0].x, b.texts[0].y), (100.0, 100.0));
+        // A grip click on a merely selected text starts typing in it.
+        e.key(&mut b, Key::Escape, A);
+        e.selected = Some(Sel::Text(id));
+        e.grab_text(&b, &c, (80.0, 110.0), id);
+        e.release(&mut b, A);
+        assert_eq!(e.editing.unwrap().target, EditTarget::FreeText(id));
+    }
+
+    #[test]
+    fn pasting_copies_a_text_box_with_its_style_and_staggers_repeats() {
+        let (mut e, mut b) = (Editor::new(), Board::new());
+        let id = b.add_text(10.0, 10.0);
+        {
+            let t = b.text_mut(id).unwrap();
+            t.text = "styled".into();
+            (t.bold, t.color, t.group) = (true, 2, 7);
+        }
+        let tmpl = b.text(id).unwrap().clone();
+        let a = e.paste_text_box(&mut b, Some(&tmpl), "", (300.0, 200.0));
+        let p = b.text(a).unwrap();
+        assert_eq!((p.text.as_str(), p.bold, p.color, p.group), ("styled", true, 2, 0));
+        assert_eq!((p.x, p.y), (300.0, 200.0));
+        assert_eq!(e.selected, Some(Sel::Text(a)));
+        let c2 = e.paste_text_box(&mut b, None, "plain\ntext", (300.0, 200.0));
+        let p2 = b.text(c2).unwrap();
+        assert_eq!((p2.x, p2.y), (324.0, 224.0), "staggered, not stacked");
+        assert_eq!((p2.text.as_str(), p2.bold), ("plain\ntext", false));
+        assert!(e.undo(&mut b) && e.undo(&mut b));
+        assert_eq!(b.texts.len(), 1);
+    }
+
+    #[test]
+    fn styled_text_is_measured_at_its_size() {
+        let mut b = Board::new();
+        let id = b.add_text(0.0, 0.0);
+        b.text_mut(id).unwrap().text = "a\nb".into();
+        let adv = |s: Style, _: char| s.size() * 0.5;
+        let g0 = text_geom(b.text(id).unwrap(), &adv);
+        b.text_mut(id).unwrap().size = crate::board::TextSize::Title;
+        let g1 = text_geom(b.text(id).unwrap(), &adv);
+        assert!(g1.rect.h > g0.rect.h * 2.0 && g1.line_h > g0.line_h);
+        // Markdown headings make the box taller than the raw text.
+        b.text_mut(id).unwrap().size = crate::board::TextSize::Medium;
+        b.text_mut(id).unwrap().text = "# a".into();
+        let md = text_geom(b.text(id).unwrap(), &adv);
+        b.text_mut(id).unwrap().plain = true;
+        let raw = text_geom(b.text(id).unwrap(), &adv);
+        assert!(md.rect.h > raw.rect.h);
     }
 
     // ---- shapes

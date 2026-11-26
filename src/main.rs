@@ -20,8 +20,10 @@
 
 mod board;
 mod camera;
+mod detail;
 mod editor;
 mod layout;
+mod md;
 mod pics;
 mod render;
 mod store;
@@ -31,7 +33,7 @@ mod text;
 use board::{Background, Board, Theme};
 use camera::Camera;
 use editor::{Button, Editor, Key};
-use layout::{area_geom, note_geom, Margins, Overlay, Rect, Tool, ViewBtn};
+use layout::{area_geom, note_geom, FmtBtn, Hover, Margins, Overlay, Rect, Tool, ViewBtn};
 use serde_json::json;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -67,6 +69,9 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use std::time::{Duration, Instant};
+
+/// How long a theme switch (or hover preview) takes to glide.
+const THEME_ANIM: Duration = Duration::from_millis(220);
 use store::{Loaded, View};
 use text::{Fonts, Style};
 use wayland_client::{
@@ -257,7 +262,8 @@ fn main() {
     };
 
     // Messages from helper threads (the folder picker) back into the event loop.
-    let (pick_tx, pick_rx) = smithay_client_toolkit::reexports::calloop::channel::channel::<String>();
+    let (pick_tx, pick_rx) =
+        smithay_client_toolkit::reexports::calloop::channel::channel::<String>();
     event_loop
         .handle()
         .insert_source(pick_rx, |ev, _, app: &mut App| {
@@ -279,6 +285,7 @@ fn main() {
         data_device: None,
         copy_source: None,
         clip_text: String::new(),
+        clip_box: None,
         key_serial: 0,
         layer,
         qh,
@@ -295,6 +302,9 @@ fn main() {
         }),
         camera_loaded: view.camera.is_some(),
         theme: view.theme,
+        anim_from: render::colors(view.theme),
+        anim_to: view.theme,
+        anim_t0: Instant::now() - THEME_ANIM,
         background: view.background,
         margins: view.margins,
         wallpaper: None,
@@ -315,6 +325,12 @@ fn main() {
         cursor: (0.0, 0.0),
         mods: Modifiers::default(),
         show_help: false,
+        detail: None,
+        chip_first: 0,
+        name_box: None,
+        last_chip_click: None,
+        theme_open: false,
+        hover: Hover::None,
         dirty: false,
         frame_pending: false,
         last_draw: Instant::now(),
@@ -348,6 +364,18 @@ fn main() {
 struct App {
     /// The keyboard shortcuts popup is open.
     show_help: bool,
+    /// The todo detail page (title, description, due date), when open.
+    detail: Option<detail::Detail>,
+    /// The popup that names a new space or renames one, when open.
+    name_box: Option<detail::NameBox>,
+    /// First space shown in the top menu (it scrolls when there are too many to fit).
+    chip_first: usize,
+    /// (time, area index) of the last click on a space in the menu, to spot a double-click.
+    last_chip_click: Option<(u32, usize)>,
+    /// The theme panel (right sidebar) is open.
+    theme_open: bool,
+    /// What the pointer is over in the overlay.
+    hover: Hover,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
@@ -359,6 +387,8 @@ struct App {
     data_device: Option<DataDevice>,
     copy_source: Option<CopyPasteSource>,
     clip_text: String,
+    /// The text box copied with Ctrl+C (pasted with its style while we still own the clipboard).
+    clip_box: Option<board::TextBox>,
     /// Serial of the latest key press (the compositor wants it when we set the selection).
     key_serial: u32,
     layer: LayerSurface,
@@ -374,6 +404,10 @@ struct App {
     /// The camera came from the save file (do not re-centre on first configure).
     camera_loaded: bool,
     theme: Theme,
+    /// Theme switch animation: blend from `anim_from` to `colors(anim_to)` since `anim_t0`.
+    anim_from: render::Colors,
+    anim_to: Theme,
+    anim_t0: Instant,
     background: Background,
     /// Gap kept clear above the chips (see `layout::Margins`).
     margins: Margins,
@@ -427,9 +461,47 @@ impl App {
     fn overlay(&self) -> Overlay {
         let f = &self.fonts;
         let (vw, vh) = self.view_size();
-        layout::overlay(&self.board, vw, vh, self.margins, &|s, t| {
-            f.text_width(s.face(), t, s.size())
-        })
+        layout::overlay_from(
+            &self.board,
+            vw,
+            vh,
+            self.margins,
+            &|s, t| f.text_width(s.face(), t, s.size()),
+            self.chip_first,
+        )
+    }
+
+    /// The theme on screen: the one under the pointer in the open picker (a live preview), else
+    /// the chosen one.
+    fn shown_theme(&self) -> Theme {
+        match self.hover {
+            Hover::Theme(t) if self.theme_open => t,
+            _ => self.theme,
+        }
+    }
+
+    /// The palette for this frame, eased toward `shown_theme`, and whether it is still moving.
+    fn palette_now(&mut self) -> (render::Colors, bool) {
+        let now = Instant::now();
+        let target = self.shown_theme();
+        let ease = |t: f32| t * t * (3.0 - 2.0 * t);
+        let progress = |t0: Instant| {
+            (now.saturating_duration_since(t0).as_secs_f32() / THEME_ANIM.as_secs_f32()).min(1.0)
+        };
+        if target != self.anim_to {
+            // Retarget from wherever the blend currently is, so reversing mid-glide is smooth.
+            let cur = render::lerp_colors(
+                &self.anim_from,
+                &render::colors(self.anim_to),
+                ease(progress(self.anim_t0)),
+            );
+            self.anim_from = cur;
+            self.anim_to = target;
+            self.anim_t0 = now;
+        }
+        let t = progress(self.anim_t0);
+        let c = render::lerp_colors(&self.anim_from, &render::colors(self.anim_to), ease(t));
+        (c, t < 1.0)
     }
 
     /// Mark state changed and draw now unless a frame is already in flight.
@@ -495,28 +567,30 @@ impl App {
         let w = self.width as i32 * scale;
         let h = self.height as i32 * scale;
         self.ensure_wallpaper(w as u32, h as u32);
+        let (palette, animating) = self.palette_now();
         let overlay = self.overlay();
-        let current = {
-            let f = &self.fonts;
-            let (vw, vh) = self.view_size();
-            layout::current_area(&self.board, &self.camera, vw, vh, &|s, c| {
-                f.advance(s.face(), c, s.size())
-            })
-        };
+        let text_bar = self.text_bar();
+        let current = self.active_space();
         let (buffer, canvas) = self
             .pool
             .create_buffer(w, h, w * 4, wl_shm::Format::Xrgb8888)
             .expect("create buffer");
 
         let scene = render::Scene {
+            text_bar: text_bar.as_ref(),
             board: &self.board,
             editor: &self.editor,
             theme: self.theme,
+            palette: Some(palette),
             background: &self.background,
             wallpaper: self.wallpaper.as_deref(),
             overlay: &overlay,
             current_area: current,
             show_help: self.show_help,
+            detail: self.detail.as_ref(),
+            name_box: self.name_box.as_ref(),
+            theme_open: self.theme_open,
+            hover: self.hover,
         };
         render::draw(
             canvas,
@@ -536,7 +610,8 @@ impl App {
         self.layer.commit();
 
         self.frame_pending = true;
-        self.dirty = false;
+        // While a theme glide is running, ask for the next frame; idle again once it ends.
+        self.dirty = animating;
         self.draws += 1;
         self.last_draw = Instant::now();
         self.arm_shrink();
@@ -587,7 +662,9 @@ impl App {
             .iter()
             .map(|t| {
                 let g = layout::text_geom(t, &adv);
-                json!({"id": t.id, "text": t.text, "x": t.x, "y": t.y, "rect": rect_json(g.rect)})
+                json!({"id": t.id, "text": t.text, "x": t.x, "y": t.y, "rect": rect_json(g.rect),
+                    "size": format!("{:?}", t.size), "bold": t.bold, "italic": t.italic,
+                    "underline": t.underline, "strike": t.strike, "plain": t.plain, "color": t.color})
             })
             .collect();
         let shapes: Vec<_> = self
@@ -623,7 +700,7 @@ impl App {
             "theme": format!("{:?}", self.theme),
             "background": {"color": self.background.color, "image_on": self.background.image_on, "image": self.background.image, "rotate_mins": self.background.rotate_mins, "random": self.background.random},
             "wallpaper_loaded": self.wallpaper.is_some(),
-            "current_area": current,
+            "current_space": current, "spaces": self.board.spaces.iter().map(|s| json!({"id": s.id, "name": s.name, "x": s.x, "y": s.y, "zoom": s.zoom})).collect::<Vec<_>>(),
             "tools": ov.tools.iter().map(|(t, r)| json!({"tool": format!("{t:?}"), "rect": rect_json(*r)})).collect::<Vec<_>>(),
             "view_buttons": ov.view_btns.iter().map(|(b, r)| json!({"button": format!("{b:?}"), "rect": rect_json(*r)})).collect::<Vec<_>>(),
             "chips": ov.chips.iter().map(|(i, r)| json!({"area": i, "rect": rect_json(*r)})).collect::<Vec<_>>(),
@@ -755,6 +832,113 @@ impl App {
 
     // ---- navigation
 
+    /// Scroll the space menu so area `i` is visible.
+    fn reveal_chip(&mut self, i: usize) {
+        if i < self.chip_first {
+            self.chip_first = i;
+        }
+        for _ in 0..self.board.spaces.len() {
+            if self.overlay().chips.iter().any(|(k, _)| *k == i) || self.chip_first >= i {
+                break;
+            }
+            self.chip_first += 1;
+        }
+    }
+
+    /// Go to a saved space: point the camera at it.
+    fn jump_to_space(&mut self, i: usize) {
+        self.reveal_chip(i);
+        let Some(sp) = self.board.spaces.get(i) else {
+            return;
+        };
+        let (vw, vh) = self.view_size();
+        layout::show_space(&mut self.camera, sp, vw, vh);
+        self.mark_dirty_for_save();
+        self.request_redraw();
+    }
+
+    /// The space being shown right now, if the view matches one.
+    fn active_space(&self) -> Option<usize> {
+        let (vw, vh) = self.view_size();
+        layout::active_space(&self.board, &self.camera, vw, vh)
+    }
+
+    /// Ctrl+Left / Ctrl+Right: go to the previous / next space.
+    fn step_space(&mut self, delta: i32) {
+        let n = self.board.spaces.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let target = match self.active_space() {
+            Some(i) => (i as i32 + delta).clamp(0, n - 1),
+            None if delta > 0 => 0,
+            None => n - 1,
+        };
+        self.jump_to_space(target as usize);
+    }
+
+    /// The "+" button: ask for a name, then save the current view as a space.
+    fn add_space(&mut self) {
+        let (vw, vh) = self.view_size();
+        let c = self.camera.screen_to_world(vw / 2.0, vh / 2.0);
+        let name = format!("Space {}", self.board.spaces.len() + 1);
+        self.name_box = Some(detail::NameBox::new(None, (c, self.camera.zoom), &name));
+        self.request_redraw();
+    }
+
+    /// Double-click on a space in the menu: rename it.
+    fn rename_space(&mut self, i: usize) {
+        if let Some(sp) = self.board.spaces.get(i) {
+            self.name_box = Some(detail::NameBox::new(
+                Some(sp.id),
+                ((sp.x, sp.y), sp.zoom),
+                &sp.name.clone(),
+            ));
+            self.request_redraw();
+        }
+    }
+
+    fn close_name_box(&mut self, save: bool) {
+        if let Some(n) = self.name_box.take() {
+            let name = n.text.trim().to_string();
+            if save && !name.is_empty() {
+                match n.space {
+                    Some(id) => {
+                        self.editor.rename_space(&mut self.board, id, &name);
+                    }
+                    None => {
+                        let id = self
+                            .editor
+                            .add_space(&mut self.board, &name, n.view.0, n.view.1);
+                        if let Some(i) = self.board.spaces.iter().position(|s| s.id == id) {
+                            self.reveal_chip(i);
+                        }
+                    }
+                }
+                self.after_edit();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn name_box_key(&mut self, ev: &KeyEvent) {
+        let key = if self.mods.ctrl && matches!(ev.keysym, Keysym::v | Keysym::V) {
+            self.clipboard_text()
+                .map(|t| Key::Text(t.replace("\r\n", " ").replace(['\r', '\n'], " ")))
+        } else {
+            self.to_key(ev)
+        };
+        let Some(key) = key else { return };
+        let Some(n) = self.name_box.as_mut() else {
+            return;
+        };
+        match n.key(key) {
+            detail::Outcome::Keep => self.request_redraw(),
+            detail::Outcome::Cancel => self.close_name_box(false),
+            detail::Outcome::Save => self.close_name_box(true),
+        }
+    }
+
     fn jump_to_area(&mut self, i: usize) {
         let Some(a) = self.board.areas.get(i) else {
             return;
@@ -823,8 +1007,17 @@ impl App {
     }
 
     fn toggle_theme(&mut self) {
-        self.theme = self.theme.toggled();
+        self.set_theme(self.theme.toggled());
+    }
+
+    fn set_theme(&mut self, t: Theme) {
+        self.theme = t;
         self.mark_dirty_for_save();
+        self.request_redraw();
+    }
+
+    fn toggle_theme_panel(&mut self) {
+        self.theme_open = !self.theme_open;
         self.request_redraw();
     }
 
@@ -845,7 +1038,11 @@ impl App {
         std::thread::spawn(move || {
             let start = format!("{}/", dir.display());
             let picked = std::process::Command::new("zenity")
-                .args(["--file-selection", "--directory", "--title=Wallpaper folder"])
+                .args([
+                    "--file-selection",
+                    "--directory",
+                    "--title=Wallpaper folder",
+                ])
                 .arg(format!("--filename={start}"))
                 .output();
             match picked {
@@ -897,10 +1094,7 @@ impl App {
             .flatten()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("png"))
-            })
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         found.sort();
@@ -984,6 +1178,52 @@ impl App {
         let Some(text) = self.editor.selected_text(&self.board) else {
             return;
         };
+        self.claim_clipboard(text);
+        self.clip_box = None;
+        if cut {
+            let f = &self.fonts;
+            let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
+            if self.editor.key(&mut self.board, Key::Cut, &adv) {
+                self.after_edit();
+            }
+        }
+    }
+
+    /// Ctrl+C / Ctrl+X on a selected text box: copy the whole box (its text goes to the system
+    /// clipboard too, so other apps can paste it).
+    fn copy_text_box(&mut self, cut: bool) {
+        let Some(t) = self
+            .editor
+            .text_focus()
+            .and_then(|id| self.board.text(id))
+            .cloned()
+        else {
+            return;
+        };
+        self.claim_clipboard(t.text.clone());
+        self.clip_box = Some(t);
+        if cut && self.editor.delete_selected(&mut self.board) {
+            self.after_edit();
+        }
+    }
+
+    /// Ctrl+D on a selected text box: a copy right next to it.
+    fn duplicate_text_box(&mut self) {
+        let Some(t) = self
+            .editor
+            .text_focus()
+            .and_then(|id| self.board.text(id))
+            .cloned()
+        else {
+            return;
+        };
+        let at = (t.x + 24.0, t.y + 24.0);
+        self.editor.paste_text_box(&mut self.board, Some(&t), "", at);
+        self.after_edit();
+    }
+
+    /// Own the system clipboard with `text`.
+    fn claim_clipboard(&mut self, text: String) {
         if let (Some(mgr), Some(dev)) = (&self.data_mgr, &self.data_device) {
             let src = mgr.create_copy_paste_source(
                 &self.qh,
@@ -998,12 +1238,42 @@ impl App {
             self.copy_source = Some(src);
         }
         self.clip_text = text;
-        if cut {
-            let f = &self.fonts;
-            let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
-            if self.editor.key(&mut self.board, Key::Cut, &adv) {
+    }
+
+    /// Where a paste lands: under the pointer when it is on the canvas, else the view centre.
+    fn paste_point(&self) -> (f32, f32) {
+        let (vw, vh) = self.view_size();
+        let (cx, cy) = self.cursor;
+        let on_canvas = cx > 0.0 && cy > 0.0 && cx < vw && cy < vh && !self.overlay().covers(cx, cy);
+        let p = if on_canvas { (cx, cy) } else { (vw / 2.0, vh / 2.0) };
+        self.camera.screen_to_world(p.0, p.1)
+    }
+
+    /// Ctrl+V with nothing being edited: a copied text box (with its style), an image, or plain
+    /// text as a new text box.
+    fn paste_board(&mut self) {
+        let at = self.paste_point();
+        if self.copy_source.is_some() {
+            if let Some(t) = self.clip_box.clone().filter(|t| t.text == self.clip_text) {
+                self.editor.paste_text_box(&mut self.board, Some(&t), "", at);
+                self.after_edit();
+                return;
+            }
+        }
+        if self.paste_image() {
+            return;
+        }
+        let text = self
+            .clipboard_text()
+            .map(|t| t.replace("\r\n", "\n").replace('\r', "\n"))
+            .filter(|t| !t.trim().is_empty());
+        match text {
+            Some(text) => {
+                let text = text.trim_end_matches('\n').to_string();
+                self.editor.paste_text_box(&mut self.board, None, &text, at);
                 self.after_edit();
             }
+            None => self.log(format_args!("[paste] nothing to paste")),
         }
     }
 
@@ -1046,7 +1316,7 @@ impl App {
     }
 
     /// Ctrl+V with nothing being edited: paste a copied image or an image file onto the board.
-    fn paste_image(&mut self) {
+    fn paste_image(&mut self) -> bool {
         let png = if self.copy_source.is_some() {
             None
         } else {
@@ -1071,7 +1341,7 @@ impl App {
         });
         let Some(bytes) = bytes else {
             self.log(format_args!("[paste] no image on the clipboard"));
-            return;
+            return false;
         };
         match pics::import_png(&bytes) {
             Ok((name, w, h)) => {
@@ -1080,8 +1350,12 @@ impl App {
                     .screen_to_world(self.width as f32 / 2.0, self.height as f32 / 2.0);
                 self.editor.add_image(&mut self.board, &name, (w, h), c);
                 self.after_edit();
+                true
             }
-            Err(e) => eprintln!("wallboard: paste: {e} (only PNG images are supported)"),
+            Err(e) => {
+                eprintln!("wallboard: paste: {e} (only PNG images are supported)");
+                false
+            }
         }
     }
 
@@ -1095,6 +1369,74 @@ impl App {
         if self.editor.key(&mut self.board, Key::Text(text), &adv) {
             self.after_edit();
         }
+    }
+
+    // ---- todo detail page
+
+    /// Open the detail page for the todo being edited (Ctrl+D). Does nothing otherwise.
+    fn open_detail(&mut self) {
+        use editor::EditTarget::{TodoBody, TodoText};
+        let Some((area, row)) = self.editor.editing.and_then(|e| match e.target {
+            TodoText(a, r) | TodoBody(a, r) => Some((a, r)),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.detail = detail::Detail::open(&self.board, area, row);
+        if self.detail.is_some() {
+            self.editor.editing = None;
+        }
+        self.request_redraw();
+    }
+
+    /// Close the detail page, saving the edits when `save`.
+    fn close_detail(&mut self, save: bool) {
+        if let Some(d) = self.detail.take() {
+            if save && d.can_save() && d.differs(&self.board) {
+                self.editor.board_changed_externally(&self.board);
+                d.apply(&mut self.board);
+                self.after_edit();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn detail_key(&mut self, ev: &KeyEvent) {
+        let pasting = self.mods.ctrl && matches!(ev.keysym, Keysym::v | Keysym::V);
+        let key = if pasting {
+            self.clipboard_text()
+                .map(|t| Key::Text(t.replace("\r\n", "\n").replace('\r', "\n")))
+        } else {
+            self.to_key(ev)
+        };
+        let Some(key) = key else { return };
+        let Some(d) = self.detail.as_mut() else {
+            return;
+        };
+        match d.key(key) {
+            detail::Outcome::Keep => self.request_redraw(),
+            detail::Outcome::Cancel => self.close_detail(false),
+            detail::Outcome::Save => self.close_detail(true),
+        }
+    }
+
+    /// A left click while the detail page is open: focus a field, or cancel when outside.
+    fn detail_click(&mut self, p: (f32, f32)) {
+        let (vw, vh) = self.view_size();
+        let pn = detail::panel(vw, vh);
+        let Some(d) = self.detail.as_mut() else {
+            return;
+        };
+        if detail::contains(pn.title, p) {
+            d.focus(detail::Field::Title);
+        } else if detail::contains(pn.desc, p) {
+            d.focus(detail::Field::Desc);
+        } else if detail::contains(pn.due, p) {
+            d.focus(detail::Field::Due);
+        } else if !detail::contains(pn.card, p) {
+            self.close_detail(false);
+        }
+        self.request_redraw();
     }
 
     // ---- keyboard
@@ -1133,11 +1475,35 @@ impl App {
     /// Handle a key press or repeat. Typing always wins while a field is being edited.
     fn handle_key(&mut self, ev: KeyEvent, repeat: bool) {
         let ctrl = self.mods.ctrl;
+        if self.name_box.is_some() {
+            self.name_box_key(&ev);
+            return;
+        }
+        if self.detail.is_some() {
+            self.detail_key(&ev);
+            return;
+        }
         if ctrl {
             match ev.keysym {
                 Keysym::q | Keysym::Q => {
                     if !repeat {
                         self.exit = true;
+                    }
+                    return;
+                }
+                Keysym::Left | Keysym::Right if self.editor.editing.is_none() => {
+                    self.step_space(if ev.keysym == Keysym::Left { -1 } else { 1 });
+                    return;
+                }
+                // Ctrl+D while editing a todo: open its detail page; on a selected text box:
+                // duplicate it.
+                Keysym::d | Keysym::D => {
+                    if !repeat {
+                        if self.editor.editing.is_none() && self.editor.text_focus().is_some() {
+                            self.duplicate_text_box();
+                        } else {
+                            self.open_detail();
+                        }
                     }
                     return;
                 }
@@ -1160,12 +1526,55 @@ impl App {
                     }
                     return;
                 }
+                Keysym::c | Keysym::C | Keysym::x | Keysym::X
+                    if self.editor.text_focus().is_some() =>
+                {
+                    if !repeat {
+                        self.copy_text_box(matches!(ev.keysym, Keysym::x | Keysym::X));
+                    }
+                    return;
+                }
+                // Text formatting on the text being typed or selected.
+                Keysym::b
+                | Keysym::B
+                | Keysym::i
+                | Keysym::I
+                | Keysym::u
+                | Keysym::U
+                | Keysym::s
+                | Keysym::S
+                | Keysym::bracketleft
+                | Keysym::bracketright
+                    if self.editor.text_focus().is_some()
+                        && !(matches!(ev.keysym, Keysym::s | Keysym::S) && !self.mods.shift) =>
+                {
+                    let id = self.editor.text_focus().unwrap_or_default();
+                    let changed = match ev.keysym {
+                        Keysym::bracketleft | Keysym::bracketright => {
+                            let up = ev.keysym == Keysym::bracketright;
+                            self.editor.step_text_size(&mut self.board, id, up)
+                        }
+                        k => {
+                            let btn = match k {
+                                Keysym::b | Keysym::B => FmtBtn::Bold,
+                                Keysym::i | Keysym::I => FmtBtn::Italic,
+                                Keysym::u | Keysym::U => FmtBtn::Underline,
+                                _ => FmtBtn::Strike,
+                            };
+                            !repeat && self.editor.format_text(&mut self.board, id, btn)
+                        }
+                    };
+                    if changed {
+                        self.after_edit();
+                    }
+                    return;
+                }
                 Keysym::v | Keysym::V => {
                     if !repeat {
                         if self.editor.editing.is_some() {
                             self.paste();
                         } else {
-                            self.paste_image();
+                            self.paste_board();
                         }
                     }
                     return;
@@ -1216,13 +1625,18 @@ impl App {
             Keysym::plus | Keysym::equal | Keysym::KP_Add => self.zoom_center(1.2),
             Keysym::minus | Keysym::KP_Subtract => self.zoom_center(1.0 / 1.2),
             Keysym::c | Keysym::C => self.capture(),
-            Keysym::l | Keysym::L => self.toggle_theme(),
+            Keysym::l => self.toggle_theme(),
+            Keysym::L => self.toggle_theme_panel(),
             Keysym::b | Keysym::B => self.cycle_background(),
             Keysym::w | Keysym::W => self.cycle_rotation(),
             Keysym::f => self.pick_wallpaper_folder(),
             Keysym::F => self.open_wallpaper_folder(),
             Keysym::question => self.show_help = !self.show_help,
             Keysym::Escape if self.show_help => self.show_help = false,
+            Keysym::Escape if self.theme_open => {
+                self.theme_open = false;
+                self.request_redraw();
+            }
             Keysym::Escape => {
                 // Esc always goes back to plain selecting: drop the selection and any armed tool.
                 self.editor.deselect();
@@ -1252,16 +1666,53 @@ impl App {
 
     // ---- pointer
 
+    /// The format bar and grip of the text being typed or selected, if any.
+    fn text_bar(&self) -> Option<layout::TextBar> {
+        if self.detail.is_some() || self.name_box.is_some() {
+            return None;
+        }
+        let id = self.editor.text_focus()?;
+        let f = &self.fonts;
+        let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
+        layout::text_bar(&self.board, id, &self.camera, self.view_size(), &adv)
+    }
+
+    /// A left press on the text format bar or grip: `Some(edited)` if it was there.
+    fn text_bar_click(&mut self, p: (f32, f32)) -> Option<bool> {
+        let bar = self.text_bar()?;
+        if bar.grip.contains(p.0, p.1) {
+            self.editor.grab_text(&self.board, &self.camera, p, bar.id);
+            return Some(false);
+        }
+        if let Some(btn) = bar.btn_at(p.0, p.1) {
+            return Some(self.editor.format_text(&mut self.board, bar.id, btn));
+        }
+        bar.covers(p.0, p.1).then_some(false)
+    }
+
     /// A left click on the screen-space overlay. Returns true if it was handled there.
-    fn overlay_click(&mut self, p: (f32, f32)) -> bool {
+    fn overlay_click(&mut self, p: (f32, f32), time: u32) -> bool {
         if self.show_help {
             // Any click closes the popup and is swallowed.
             self.show_help = false;
             return true;
         }
         let ov = self.overlay();
+        let was_open = self.theme_open;
+        if self.theme_open {
+            if let Some(t) = ov.theme_at(p.0, p.1) {
+                self.set_theme(t);
+                return true;
+            }
+            if ov.theme_panel.contains(p.0, p.1) {
+                return true;
+            }
+            // Anywhere else closes the panel; the Theme button itself just toggles it below.
+            self.theme_open = false;
+        }
         if let Some(btn) = ov.view_at(p.0, p.1) {
             match btn {
+                ViewBtn::Theme => self.theme_open = !was_open,
                 ViewBtn::Help => self.show_help = true,
                 ViewBtn::ZoomIn => self.zoom_center(1.2),
                 ViewBtn::ZoomOut => self.zoom_center(1.0 / 1.2),
@@ -1273,11 +1724,37 @@ impl App {
             self.set_tool(tool);
             return true;
         }
+        if ov.plus_at(p.0, p.1) {
+            self.add_space();
+            return true;
+        }
         if let Some(i) = ov.chip_at(p.0, p.1) {
-            self.jump_to_area(i);
+            let double = self
+                .last_chip_click
+                .is_some_and(|(t, k)| k == i && time.wrapping_sub(t) < 400);
+            if double {
+                self.last_chip_click = None;
+                self.rename_space(i);
+            } else {
+                self.last_chip_click = Some((time, i));
+                self.jump_to_space(i);
+            }
             return true;
         }
         ov.covers(p.0, p.1) // clicks on a pill's padding go nowhere
+    }
+
+    /// Recompute what the pointer is over. True if it changed (then a redraw is due).
+    fn update_hover(&mut self, p: (f32, f32)) -> bool {
+        let bar = self.text_bar();
+        let h = match bar.as_ref() {
+            Some(b) if b.grip.contains(p.0, p.1) => Hover::Grip,
+            Some(b) if b.btn_at(p.0, p.1).is_some() => Hover::Fmt(b.btn_at(p.0, p.1).unwrap()),
+            _ => self.overlay().hover_at(p.0, p.1, self.theme_open),
+        };
+        let changed = h != self.hover;
+        self.hover = h;
+        changed
     }
 
     fn handle_axis(&mut self, h: AxisScroll, v: AxisScroll) {
@@ -1290,6 +1767,18 @@ impl App {
         };
         let (cx, cy) = self.cursor;
         let (dx, dy) = (px(h, PAN_PER_NOTCH), px(v, PAN_PER_NOTCH));
+        // Over the space menu the wheel scrolls it instead of the canvas.
+        if self
+            .overlay()
+            .chips_pill
+            .is_some_and(|r| r.contains(cx, cy))
+        {
+            let step = (dx + dy).signum() as i32;
+            let max = self.board.spaces.len().saturating_sub(1) as i32;
+            self.chip_first = (self.chip_first as i32 + step).clamp(0, max) as usize;
+            self.request_redraw();
+            return;
+        }
         if self.mods.ctrl {
             // Ctrl+scroll zooms around the cursor (scroll up = zoom in).
             let notches = -px(v, PX_PER_NOTCH) / PX_PER_NOTCH;
@@ -1548,10 +2037,19 @@ impl PointerHandler for App {
             }
             let pos = (e.position.0 as f32, e.position.1 as f32);
             match e.kind {
-                PointerEventKind::Enter { .. } => self.cursor = pos,
-                PointerEventKind::Leave { .. } => {}
+                PointerEventKind::Enter { .. } => {
+                    self.cursor = pos;
+                    redraw |= self.update_hover(pos);
+                }
+                PointerEventKind::Leave { .. } => {
+                    if self.hover != Hover::None {
+                        self.hover = Hover::None;
+                        redraw = true;
+                    }
+                }
                 PointerEventKind::Motion { .. } => {
                     self.cursor = pos;
+                    redraw |= self.update_hover(pos);
                     if self.editor.is_dragging() {
                         let f = &self.fonts;
                         let adv = |s: Style, c: char| f.advance(s.face(), c, s.size());
@@ -1571,8 +2069,42 @@ impl PointerHandler for App {
                         BTN_MIDDLE => Some(Button::Middle),
                         _ => None,
                     };
-                    if let Some(b) = b {
-                        if b == Button::Left && self.overlay_click(pos) {
+                    if self.name_box.is_some() {
+                        if b == Some(Button::Left) {
+                            let (vw, vh) = self.view_size();
+                            let (card, _) = detail::name_panel(vw, vh);
+                            if !detail::contains(card, pos) {
+                                self.close_name_box(false);
+                            }
+                        }
+                    } else if self.detail.is_some() {
+                        if b == Some(Button::Left) {
+                            self.detail_click(pos);
+                        }
+                    } else if let Some(b) = b {
+                        let on_bar = if b == Button::Left {
+                            self.text_bar_click(pos)
+                        } else {
+                            None
+                        };
+                        if let Some(e) = on_bar {
+                            edited |= e;
+                            redraw = true;
+                        } else if b == Button::Left && self.overlay_click(pos, time) {
+                            redraw = true;
+                        } else if b == Button::Right
+                            && self.overlay().chip_at(pos.0, pos.1).is_some()
+                        {
+                            // Right-click a space in the menu: delete it (Ctrl+Z brings it back).
+                            let id = self
+                                .overlay()
+                                .chip_at(pos.0, pos.1)
+                                .and_then(|i| self.board.spaces.get(i).map(|s| s.id));
+                            if let Some(id) = id {
+                                if self.editor.delete_space(&mut self.board, id) {
+                                    self.after_edit();
+                                }
+                            }
                             redraw = true;
                         } else if !self.overlay().covers(pos.0, pos.1) {
                             let f = &self.fonts;

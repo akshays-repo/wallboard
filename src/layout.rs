@@ -2,7 +2,9 @@
 //! screen-space toolbar, view menu and chips. Used by rendering, hit-testing and the editor so
 //! they always agree. Pure logic: text measuring comes in as a closure.
 
-use crate::board::{Area, Board, Connector, End, Note, Shape, ShapeKind, TextBox, Todo};
+use crate::board::{
+    Area, Board, Connector, End, Note, Shape, ShapeKind, TextBox, TextSize, Theme, Todo,
+};
 use crate::camera::Camera;
 use crate::text::{wrap, Line, Style};
 use serde::{Deserialize, Serialize};
@@ -286,6 +288,24 @@ impl Handle {
     }
 }
 
+/// Every item whose bounds touch `r` (a world rectangle), in a stable order.
+pub fn items_in_rect(board: &Board, r: Rect, adv: Adv) -> Vec<Sel> {
+    let all = board
+        .areas
+        .iter()
+        .map(|a| Sel::Area(a.id))
+        .chain(board.notes.iter().map(|n| Sel::Note(n.id)))
+        .chain(board.shapes.iter().map(|s| Sel::Shape(s.id)))
+        .chain(board.texts.iter().map(|t| Sel::Text(t.id)))
+        .chain(board.connectors.iter().map(|c| Sel::Connector(c.id)));
+    all.filter(|&sel| {
+        selection_rect(board, sel, adv).is_some_and(|b| {
+            b.x < r.x + r.w && b.x + b.w > r.x && b.y < r.y + r.h && b.y + b.h > r.y
+        })
+    })
+    .collect()
+}
+
 /// Bounding rectangle of the selected item.
 pub fn selection_rect(board: &Board, sel: Sel, adv: Adv) -> Option<Rect> {
     Some(match sel {
@@ -355,34 +375,157 @@ pub fn hit_handle(board: &Board, sel: Sel, wx: f32, wy: f32, tol: f32, adv: Adv)
         .map(|(h, _)| h)
 }
 
-/// Line height of free text, world units.
+/// Line height of medium free text, world units (`TextBox::line_h` for any size).
+#[allow(dead_code)]
 pub const TEXT_LINE_H: f32 = 28.0;
 const TEXT_MIN_W: f32 = 64.0;
 
 #[derive(Debug, Clone)]
 pub struct TextGeom {
     pub rect: Rect,
+    /// Lines of the raw text (what the editor works on).
     pub lines: Vec<Line>,
+    /// Height of one raw line.
+    pub line_h: f32,
 }
 
-/// Free text is as wide as its longest line (no wrapping) and one line is `TEXT_LINE_H` tall.
+/// Free text is as wide as its longest line (no wrapping). The box covers both the raw text and
+/// its rendered Markdown, so it does not jump when editing starts or stops.
 pub fn text_geom(t: &TextBox, adv: Adv) -> TextGeom {
+    let st = t.style();
+    let line_h = t.line_h();
     let chars: Vec<char> = t.text.chars().collect();
-    let lines = wrap(&chars, f32::MAX, &|c| adv(Style::Free, c));
-    let w = lines
+    let lines = wrap(&chars, f32::MAX, &|c| adv(st, c));
+    let mut w = lines
         .iter()
-        .map(|l| {
-            chars[l.start..l.end]
-                .iter()
-                .map(|&c| adv(Style::Free, c))
-                .sum::<f32>()
-        })
-        .fold(0.0_f32, f32::max)
-        .max(TEXT_MIN_W);
-    TextGeom {
-        rect: Rect::new(t.x, t.y, w, lines.len() as f32 * TEXT_LINE_H),
-        lines,
+        .map(|l| chars[l.start..l.end].iter().map(|&c| adv(st, c)).sum::<f32>())
+        .fold(0.0_f32, f32::max);
+    let mut h = lines.len() as f32 * line_h;
+    if !t.plain {
+        let md = crate::md::layout(&t.text, t.size, t.bold, adv);
+        (w, h) = (w.max(md.w), h.max(md.h));
     }
+    if t.italic {
+        w += t.size.px() * 0.2;
+    }
+    TextGeom {
+        rect: Rect::new(t.x, t.y, w.max(TEXT_MIN_W), h),
+        lines,
+        line_h,
+    }
+}
+
+/// A button on the floating format bar of a text box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmtBtn {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Size(TextSize),
+    /// 0 = theme text colour, else an accent index.
+    Color(u8),
+    /// Toggle Markdown rendering.
+    Markdown,
+}
+
+/// Text colours offered on the format bar (0 = theme text colour).
+pub const TEXT_COLORS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// The format bar and drag grip of the focused text box, in screen (logical) px.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextBar {
+    pub id: u64,
+    pub bar: Rect,
+    pub btns: Vec<(FmtBtn, Rect)>,
+    /// Separators between button groups (x positions).
+    pub seps: Vec<f32>,
+    /// The handle left of the text: drag it to move the text, even while typing.
+    pub grip: Rect,
+}
+
+impl TextBar {
+    pub fn btn_at(&self, x: f32, y: f32) -> Option<FmtBtn> {
+        self.btns.iter().find(|(_, r)| r.contains(x, y)).map(|(b, _)| *b)
+    }
+    pub fn covers(&self, x: f32, y: f32) -> bool {
+        self.bar.contains(x, y) || self.grip.contains(x, y)
+    }
+}
+
+const BAR_BTN: f32 = 28.0;
+const BAR_SWATCH: f32 = 22.0;
+const BAR_PAD: f32 = 5.0;
+const BAR_SEP: f32 = 9.0;
+
+/// Where the format bar and grip of text `id` go, given the camera and view size.
+pub fn text_bar(
+    board: &Board,
+    id: u64,
+    cam: &crate::camera::Camera,
+    (vw, vh): (f32, f32),
+    adv: Adv,
+) -> Option<TextBar> {
+    let t = board.text(id)?;
+    let r = text_geom(t, adv).rect;
+    let (sx, sy) = cam.world_to_screen(r.x, r.y);
+    let sh = r.h * cam.zoom;
+    let mut btns = Vec::new();
+    let mut seps = Vec::new();
+    let mut x = BAR_PAD;
+    let group = |list: &[FmtBtn], bw: f32, x: &mut f32, btns: &mut Vec<_>| {
+        for b in list {
+            btns.push((*b, Rect::new(*x, BAR_PAD, bw, BAR_BTN)));
+            *x += bw + 2.0;
+        }
+    };
+    group(
+        &[FmtBtn::Bold, FmtBtn::Italic, FmtBtn::Underline, FmtBtn::Strike],
+        BAR_BTN,
+        &mut x,
+        &mut btns,
+    );
+    for list in [
+        TextSize::ALL.map(FmtBtn::Size).to_vec(),
+        TEXT_COLORS.map(FmtBtn::Color).to_vec(),
+        vec![FmtBtn::Markdown],
+    ] {
+        seps.push(x + BAR_SEP / 2.0 - 1.0);
+        x += BAR_SEP;
+        let bw = if matches!(list[0], FmtBtn::Color(_)) {
+            BAR_SWATCH
+        } else if list[0] == FmtBtn::Markdown {
+            BAR_BTN + 10.0
+        } else {
+            BAR_BTN
+        };
+        group(&list, bw, &mut x, &mut btns);
+    }
+    let bw = x - 2.0 + BAR_PAD;
+    let bh = BAR_BTN + 2.0 * BAR_PAD;
+    let bx = sx.clamp(8.0, (vw - bw - 8.0).max(8.0));
+    // Above the text if there is room (clear of the top menu), else below it.
+    let above = sy - 12.0 - bh;
+    let by = if above >= 64.0 || sy + sh + 12.0 + bh > vh {
+        above.max(8.0)
+    } else {
+        sy + sh + 12.0
+    };
+    for (_, b) in &mut btns {
+        b.x += bx;
+        b.y += by;
+    }
+    let seps = seps.into_iter().map(|s| s + bx).collect();
+    let first = t.line_h().max(t.size.px()) * cam.zoom;
+    let gh = 26.0_f32.max(first.min(40.0));
+    let grip = Rect::new(sx - 26.0, sy + (first - gh) / 2.0, 20.0, gh);
+    Some(TextBar {
+        id,
+        bar: Rect::new(bx, by, bw, bh),
+        btns,
+        seps,
+        grip,
+    })
 }
 
 /// True if a world point is on a shape (inside a rectangle/ellipse, near a line).
@@ -760,6 +903,25 @@ pub fn bounds(board: &Board, adv: Adv) -> Option<Rect> {
 }
 
 /// The area nearest the centre of the view (0 distance if the centre is inside a card).
+/// The saved space the camera is showing right now (same centre and zoom), if any.
+pub fn active_space(board: &Board, cam: &Camera, vw: f32, vh: f32) -> Option<usize> {
+    let (cx, cy) = cam.screen_to_world(vw / 2.0, vh / 2.0);
+    board.spaces.iter().position(|s| {
+        (s.x - cx).abs() * cam.zoom < 3.0
+            && (s.y - cy).abs() * cam.zoom < 3.0
+            && (s.zoom - cam.zoom).abs() < 0.01 * s.zoom
+    })
+}
+
+/// Point the camera at a saved space.
+pub fn show_space(cam: &mut Camera, s: &crate::board::Space, vw: f32, vh: f32) {
+    cam.zoom = s
+        .zoom
+        .clamp(crate::camera::MIN_ZOOM, crate::camera::MAX_ZOOM);
+    cam.x = s.x - vw / 2.0 / cam.zoom;
+    cam.y = s.y - vh / 2.0 / cam.zoom;
+}
+
 pub fn current_area(board: &Board, cam: &Camera, vw: f32, vh: f32, adv: Adv) -> Option<usize> {
     let (cx, cy) = cam.screen_to_world(vw / 2.0, vh / 2.0);
     board
@@ -783,15 +945,18 @@ pub enum ViewBtn {
     ZoomOut,
     /// Cycle the canvas background (the same as the `B` key).
     Background,
+    /// Open the theme panel (the same as `Shift+L`).
+    Theme,
     /// Show the keyboard shortcuts popup (the same as the `?` key).
     Help,
 }
 
 impl ViewBtn {
-    pub const ALL: [ViewBtn; 4] = [
+    pub const ALL: [ViewBtn; 5] = [
         ViewBtn::ZoomIn,
         ViewBtn::ZoomOut,
         ViewBtn::Background,
+        ViewBtn::Theme,
         ViewBtn::Help,
     ];
 }
@@ -808,7 +973,36 @@ pub struct Overlay {
     pub chips_pill: Option<Rect>,
     /// (area index, rect)
     pub chips: Vec<(usize, Rect)>,
+    /// The "+" button that adds a space.
+    pub plus: Option<Rect>,
+    /// The menu is scrolled: spaces are hidden before / after the visible ones.
+    pub more_left: bool,
+    pub more_right: bool,
+    /// The theme panel, left of the view menu (only drawn while open) and its rows.
+    pub theme_panel: Rect,
+    pub theme_items: Vec<(Theme, Rect)>,
 }
+
+/// What the pointer is over in the screen-space overlay (drives hover effects).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Hover {
+    #[default]
+    None,
+    Tool(Tool),
+    View(ViewBtn),
+    Chip(usize),
+    /// The "+" in the space menu.
+    AddSpace,
+    Theme(Theme),
+    /// A button of the text format bar.
+    Fmt(FmtBtn),
+    /// The drag grip of the focused text.
+    Grip,
+}
+
+pub const THEME_PANEL_W: f32 = 232.0;
+const THEME_HEAD_H: f32 = 40.0;
+pub const THEME_ROW_H: f32 = 48.0;
 
 const CHIP_H: f32 = 28.0;
 const CHIP_PAD: f32 = 12.0;
@@ -873,6 +1067,18 @@ pub fn overlay(
     m: Margins,
     tw: &dyn Fn(Style, &str) -> f32,
 ) -> Overlay {
+    overlay_from(board, vw, vh, m, tw, 0)
+}
+
+/// Like `overlay`, with the space menu scrolled so it starts at space `first`.
+pub fn overlay_from(
+    board: &Board,
+    vw: f32,
+    vh: f32,
+    m: Margins,
+    tw: &dyn Fn(Style, &str) -> f32,
+    first: usize,
+) -> Overlay {
     let m = m.sane();
     // Toolbar: a vertical pill at the left, centred vertically.
     let n = Tool::ALL.len() as f32;
@@ -906,31 +1112,63 @@ pub fn overlay(
         })
         .collect();
 
-    // Chips: as many areas as fit.
+    // Space menu: the titles from `first` on that fit, then a "+" button that is always there.
     let max_w = (vw - 40.0).max(0.0);
+    let first = first.min(board.spaces.len().saturating_sub(1));
     let mut widths = Vec::new();
-    let mut used = 2.0 * PILL_PAD;
-    for a in &board.areas {
-        let w = tw(Style::ChipBold, &a.name) + 2.0 * CHIP_PAD;
+    let mut used = 2.0 * PILL_PAD + CHIP_H + CHIP_GAP;
+    for sp in board.spaces.iter().skip(first) {
+        let w = tw(Style::ChipBold, &sp.name) + 2.0 * CHIP_PAD;
         let next = used + w + if widths.is_empty() { 0.0 } else { CHIP_GAP };
-        if next > max_w {
+        if next > max_w && !widths.is_empty() {
             break;
         }
         used = next;
         widths.push(w);
     }
-    let (chips_pill, chips) = match row_of(&widths, vw, m.top, CHIP_H, CHIP_GAP) {
-        Some((p, r)) => (Some(p), r.into_iter().enumerate().collect()),
+    let shown = widths.len();
+    widths.push(CHIP_H); // the "+" button
+    let (chips_pill, mut chips) = match row_of(&widths, vw, m.top, CHIP_H, CHIP_GAP) {
+        Some((p, r)) => (Some(p), r.into_iter().enumerate().collect::<Vec<_>>()),
         None => (None, Vec::new()),
     };
+    let plus = chips.pop().map(|(_, r)| r);
+    for c in &mut chips {
+        c.0 += first;
+    }
+    let more_left = first > 0;
+    let more_right = first + shown < board.spaces.len();
+
+    // Theme panel: a card to the left of the view menu, kept on screen.
+    let n = Theme::ALL.len() as f32;
+    let ph = THEME_HEAD_H + n * THEME_ROW_H + 8.0;
+    let px = (view_pill.x - 12.0 - THEME_PANEL_W).max(8.0);
+    let py = view_pill.y.min(vh - ph - 10.0).max(8.0);
+    let theme_panel = Rect::new(px, py, THEME_PANEL_W, ph);
+    let theme_items = Theme::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let y = py + THEME_HEAD_H + i as f32 * THEME_ROW_H;
+            (
+                *t,
+                Rect::new(px + 8.0, y, THEME_PANEL_W - 16.0, THEME_ROW_H - 4.0),
+            )
+        })
+        .collect();
 
     Overlay {
+        theme_panel,
+        theme_items,
         tools_pill,
         tools,
         view_pill,
         view_btns,
         chips_pill,
         chips,
+        plus,
+        more_left,
+        more_right,
     }
 }
 
@@ -940,6 +1178,33 @@ impl Overlay {
             .iter()
             .find(|(_, r)| r.contains(x, y))
             .map(|(b, _)| *b)
+    }
+
+    /// The overlay item under the point. The theme rows only count while the panel is open.
+    pub fn hover_at(&self, x: f32, y: f32, theme_open: bool) -> Hover {
+        if theme_open {
+            if let Some(t) = self.theme_at(x, y) {
+                return Hover::Theme(t);
+            }
+        }
+        if let Some(b) = self.view_at(x, y) {
+            Hover::View(b)
+        } else if let Some(t) = self.tool_at(x, y) {
+            Hover::Tool(t)
+        } else if let Some(i) = self.chip_at(x, y) {
+            Hover::Chip(i)
+        } else if self.plus_at(x, y) {
+            Hover::AddSpace
+        } else {
+            Hover::None
+        }
+    }
+
+    pub fn theme_at(&self, x: f32, y: f32) -> Option<Theme> {
+        self.theme_items
+            .iter()
+            .find(|(_, r)| r.contains(x, y))
+            .map(|(t, _)| *t)
     }
 
     pub fn tool_at(&self, x: f32, y: f32) -> Option<Tool> {
@@ -953,6 +1218,9 @@ impl Overlay {
             .iter()
             .find(|(_, r)| r.contains(x, y))
             .map(|(i, _)| *i)
+    }
+    pub fn plus_at(&self, x: f32, y: f32) -> bool {
+        self.plus.is_some_and(|r| r.contains(x, y))
     }
     /// True if the point is over any pill (clicks there must not reach the canvas).
     pub fn covers(&self, x: f32, y: f32) -> bool {
@@ -1125,9 +1393,18 @@ mod tests {
         assert_eq!(current_area(&Board::new(), &cam, 1920.0, 1080.0, A), None);
     }
 
+    /// A board with `n` saved spaces.
+    fn spaced(n: usize) -> Board {
+        let mut b = Board::default_board();
+        for i in 0..n {
+            b.add_space(&format!("Space number {i}"), i as f32 * 500.0, 0.0, 1.0);
+        }
+        b
+    }
+
     #[test]
     fn overlay_toolbar_and_chips() {
-        let b = Board::default_board();
+        let b = spaced(7);
         let o = overlay(&b, 1920.0, 1080.0, Margins::default(), &tw);
         assert_eq!(o.tools.len(), 13);
         assert_eq!(o.tools[0].0, Tool::Select);
@@ -1150,8 +1427,65 @@ mod tests {
     }
 
     #[test]
+    fn a_space_is_active_only_when_the_camera_shows_it() {
+        let mut b = Board::new();
+        b.add_space("A", 100.0, 200.0, 1.5);
+        let mut cam = Camera {
+            x: 0.0,
+            y: 0.0,
+            zoom: 1.0,
+        };
+        assert_eq!(active_space(&b, &cam, 1920.0, 1080.0), None);
+        show_space(&mut cam, &b.spaces[0], 1920.0, 1080.0);
+        assert_eq!(active_space(&b, &cam, 1920.0, 1080.0), Some(0));
+        let c = cam.screen_to_world(960.0, 540.0);
+        assert!((c.0 - 100.0).abs() < 1e-3 && (c.1 - 200.0).abs() < 1e-3);
+        cam.pan_by_screen(40.0, 0.0);
+        assert_eq!(
+            active_space(&b, &cam, 1920.0, 1080.0),
+            None,
+            "panning away deselects it"
+        );
+    }
+
+    #[test]
+    fn space_menu_has_a_plus_even_with_no_spaces() {
+        let o = overlay(&Board::new(), 1920.0, 1080.0, Margins::default(), &tw);
+        let plus = o.plus.expect("plus button");
+        assert!(o.chips.is_empty() && o.chips_pill.is_some());
+        assert!(o.plus_at(plus.x + 1.0, plus.y + 1.0) && o.covers(plus.x + 1.0, plus.y + 1.0));
+        assert_eq!(
+            o.hover_at(plus.x + 1.0, plus.y + 1.0, false),
+            Hover::AddSpace
+        );
+    }
+
+    #[test]
+    fn space_menu_scrolls_and_keeps_the_plus_on_screen() {
+        let b = spaced(7);
+        let o0 = overlay_from(&b, 300.0, 600.0, Margins::default(), &tw, 0);
+        assert!(o0.more_right && !o0.more_left);
+        let first_hidden = o0.chips.last().unwrap().0 + 1;
+        let o1 = overlay_from(&b, 300.0, 600.0, Margins::default(), &tw, first_hidden);
+        assert!(o1.more_left);
+        assert_eq!(o1.chips[0].0, first_hidden, "indices are real area indices");
+        for o in [&o0, &o1] {
+            let p = o.chips_pill.unwrap();
+            let plus = o.plus.unwrap();
+            assert!(p.x >= 0.0 && p.right() <= 300.0);
+            assert!(plus.x >= p.x && plus.right() <= p.right());
+            let last = o.chips.last().unwrap().1;
+            assert!(last.right() <= plus.x, "plus sits after the last title");
+        }
+        // scrolled past the end still shows the last space
+        let o = overlay_from(&b, 1920.0, 1080.0, Margins::default(), &tw, 99);
+        assert_eq!(o.chips.last().unwrap().0, b.spaces.len() - 1);
+        assert!(!o.more_right);
+    }
+
+    #[test]
     fn overlay_drops_chips_that_do_not_fit_and_survives_small_screens() {
-        let b = Board::default_board();
+        let b = spaced(7);
         let o = overlay(&b, 300.0, 600.0, Margins::default(), &tw);
         assert!(o.chips.len() < 7);
         let p = o.chips_pill.unwrap();
@@ -1187,6 +1521,7 @@ mod tests {
                 ViewBtn::ZoomIn,
                 ViewBtn::ZoomOut,
                 ViewBtn::Background,
+                ViewBtn::Theme,
                 ViewBtn::Help
             ]
         );

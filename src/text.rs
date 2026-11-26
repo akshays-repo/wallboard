@@ -30,13 +30,14 @@ pub enum Style {
     Chip,      // 13 regular
     ChipBold,  // 13 bold
     Hint,      // 11 regular
-    Free,      // 20 regular, free text on the canvas
+    /// Free text on the canvas: its size and whether it is bold.
+    Free(crate::board::TextSize, bool),
 }
 
 impl Style {
     pub fn face(self) -> Face {
         match self {
-            Style::HeroTitle | Style::Title | Style::ChipBold => Face::Bold,
+            Style::HeroTitle | Style::Title | Style::ChipBold | Style::Free(_, true) => Face::Bold,
             _ => Face::Regular,
         }
     }
@@ -47,7 +48,7 @@ impl Style {
             Style::Row => 15.0,
             Style::Chip | Style::ChipBold => 13.0,
             Style::Hint => 11.0,
-            Style::Free => 20.0,
+            Style::Free(s, _) => s.px(),
         }
     }
 }
@@ -312,13 +313,31 @@ pub fn blit(
     rgb: (u8, u8, u8),
     clip: (i32, i32),
 ) {
+    blit_slanted(canvas, w, h, g, x, y, rgb, clip, (0.0, 0));
+}
+
+/// `blit` with a synthetic oblique: each row is shifted right by `slant.0` px per px it sits
+/// above the baseline row `slant.1` (an italic without an italic font).
+#[allow(clippy::too_many_arguments)]
+pub fn blit_slanted(
+    canvas: &mut [u8],
+    w: i32,
+    h: i32,
+    g: &Glyph,
+    x: i32,
+    y: i32,
+    rgb: (u8, u8, u8),
+    clip: (i32, i32),
+    slant: (f32, i32),
+) {
     for row in 0..g.h as i32 {
         let py = y + row;
         if py < 0 || py >= h {
             continue;
         }
+        let shift = ((slant.1 - py) as f32 * slant.0).round() as i32;
         for col in 0..g.w as i32 {
-            let px = x + col;
+            let px = x + col + shift;
             if px < 0 || px >= w || px < clip.0 || px >= clip.1 {
                 continue;
             }

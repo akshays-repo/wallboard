@@ -74,7 +74,7 @@ has keyboard focus. Quit with `Ctrl+Q`.
 | `C` | capture a new todo into Inbox, from anywhere |
 | `0` | fit everything on screen |
 | `+` / `-` | zoom |
-| `L` | dark / light |
+| `L` / `Shift+L` | dark / light; open the **theme picker** (also the half-moon button on the right menu): Dark, Light, Aurora, Neon, Blueprint, Paper, Brutal. Hovering any toolbar, menu or chip button highlights it |
 | `B` | cycle the background: theme colour, six colours, then each wallpaper |
 | `F` / `Shift+F` | pick the wallpaper folder in a dialog (needs `zenity`; else it opens the folder) / open it in the file manager |
 | `W` | wallpaper rotation: off, in order, random (every 30 min, or `rotate_mins`) |
@@ -83,9 +83,35 @@ has keyboard focus. Quit with `Ctrl+Q`.
 | `Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y` | undo, redo |
 | `Ctrl+Q` | quit |
 
+### Text boxes
+
+Press `X` (or the **T** on the toolbar) and click to type free text. Select a text box, or click
+into it, and a **format bar** appears above it:
+
+- **B / I / U / S**: bold, italic, underline, strike-through (`Ctrl+B`, `Ctrl+I`, `Ctrl+U`,
+  `Ctrl+Shift+S`)
+- four sizes: small, medium, heading, title (`Ctrl+[` / `Ctrl+]` step down / up)
+- eight colours (the first is the theme's text colour)
+- **MD**: render the text as Markdown (on by default)
+
+The style applies to the whole box. To move a text box, drag the **grip** (the dots to its left).
+This works while you are typing too. A plain drag on a box you are not editing also moves it.
+
+**Copy and paste:** with a text box selected (not typing), `Ctrl+C` copies it and `Ctrl+V`
+pastes a copy, with its style, under the pointer. `Ctrl+X` cuts it and `Ctrl+D` duplicates it.
+The text also goes to the system clipboard. Text copied in another app and pasted with
+`Ctrl+V` (when nothing is being edited) becomes a new text box. A PNG still becomes an image.
+
+**Markdown** is rendered while you are not typing in the box. While you type you see the raw
+text. One line is one block: `#`, `##`, `###` headings, `-` / `*` bullets (indent two spaces to
+nest), `1.` numbered items, `- [ ]` / `- [x]` tasks, `> ` quotes, `---` rules, and inline
+`**bold**`, `*italic*`, `~~strike~~`, `` `code` `` (`\*` for a literal star). Long lines do not
+wrap.
+
 Typing: **Enter** adds a todo below (on an empty todo it discards it), **Tab** opens a todo's
 details (Shift+Tab goes back), **Ctrl+Enter** toggles done, **Ctrl+P** cycles priority,
-arrows / Home / End move, **Esc** stops. No IME, no rich text, Latin text only.
+arrows / Home / End move, **Esc** stops. No IME, Latin text only (no per-character styling:
+a text box has one style plus its Markdown).
 
 The **Focus** card holds at most **3 open todos**: finish one to add another.
 
