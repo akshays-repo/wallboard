@@ -545,8 +545,14 @@ mod tests {
         {
             let tb = b.text_mut(t).unwrap();
             tb.size = crate::board::TextSize::Title;
-            (tb.bold, tb.italic, tb.underline, tb.strike, tb.plain, tb.color) =
-                (true, true, true, true, true, 4);
+            (
+                tb.bold,
+                tb.italic,
+                tb.underline,
+                tb.strike,
+                tb.plain,
+                tb.color,
+            ) = (true, true, true, true, true, 4);
         }
         let sh = b.add_shape(crate::board::ShapeKind::Ellipse, 1.0, 2.0);
         b.shape_mut(sh).unwrap().x2 = 90.0;

@@ -1229,7 +1229,8 @@ impl App {
             return;
         };
         let at = (t.x + 24.0, t.y + 24.0);
-        self.editor.paste_text_box(&mut self.board, Some(&t), "", at);
+        self.editor
+            .paste_text_box(&mut self.board, Some(&t), "", at);
         self.after_edit();
     }
 
@@ -1255,8 +1256,13 @@ impl App {
     fn paste_point(&self) -> (f32, f32) {
         let (vw, vh) = self.view_size();
         let (cx, cy) = self.cursor;
-        let on_canvas = cx > 0.0 && cy > 0.0 && cx < vw && cy < vh && !self.overlay().covers(cx, cy);
-        let p = if on_canvas { (cx, cy) } else { (vw / 2.0, vh / 2.0) };
+        let on_canvas =
+            cx > 0.0 && cy > 0.0 && cx < vw && cy < vh && !self.overlay().covers(cx, cy);
+        let p = if on_canvas {
+            (cx, cy)
+        } else {
+            (vw / 2.0, vh / 2.0)
+        };
         self.camera.screen_to_world(p.0, p.1)
     }
 
@@ -1266,7 +1272,8 @@ impl App {
         let at = self.paste_point();
         if self.copy_source.is_some() {
             if let Some(t) = self.clip_box.clone().filter(|t| t.text == self.clip_text) {
-                self.editor.paste_text_box(&mut self.board, Some(&t), "", at);
+                self.editor
+                    .paste_text_box(&mut self.board, Some(&t), "", at);
                 self.after_edit();
                 return;
             }
@@ -1733,7 +1740,13 @@ impl App {
         } else {
             layout::BarKind::Inline
         };
-        Some(layout::format_bar(kind, r, 0.0, &self.camera, self.view_size()))
+        Some(layout::format_bar(
+            kind,
+            r,
+            0.0,
+            &self.camera,
+            self.view_size(),
+        ))
     }
 
     /// A left press on the text format bar or grip: `Some(edited)` if it was there.

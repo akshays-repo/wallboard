@@ -398,7 +398,12 @@ pub fn text_geom(t: &TextBox, adv: Adv) -> TextGeom {
     let lines = wrap(&chars, f32::MAX, &|c| adv(st, c));
     let mut w = lines
         .iter()
-        .map(|l| chars[l.start..l.end].iter().map(|&c| adv(st, c)).sum::<f32>())
+        .map(|l| {
+            chars[l.start..l.end]
+                .iter()
+                .map(|&c| adv(st, c))
+                .sum::<f32>()
+        })
         .fold(0.0_f32, f32::max);
     let mut h = lines.len() as f32 * line_h;
     if !t.plain {
@@ -463,7 +468,10 @@ pub struct TextBar {
 
 impl TextBar {
     pub fn btn_at(&self, x: f32, y: f32) -> Option<FmtBtn> {
-        self.btns.iter().find(|(_, r)| r.contains(x, y)).map(|(b, _)| *b)
+        self.btns
+            .iter()
+            .find(|(_, r)| r.contains(x, y))
+            .map(|(b, _)| *b)
     }
     pub fn on_grip(&self, x: f32, y: f32) -> bool {
         self.grip.is_some_and(|g| g.contains(x, y))

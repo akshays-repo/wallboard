@@ -137,7 +137,11 @@ impl TextSize {
     /// One step bigger (`up`) or smaller, stopping at the ends.
     pub fn step(self, up: bool) -> TextSize {
         let i = TextSize::ALL.iter().position(|s| *s == self).unwrap_or(1);
-        let j = if up { (i + 1).min(3) } else { i.saturating_sub(1) };
+        let j = if up {
+            (i + 1).min(3)
+        } else {
+            i.saturating_sub(1)
+        };
         TextSize::ALL[j]
     }
 }

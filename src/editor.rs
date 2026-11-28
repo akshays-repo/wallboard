@@ -265,7 +265,12 @@ pub fn field_rect(board: &Board, t: EditTarget, adv: Adv) -> Option<crate::layou
         EditTarget::AreaTitle(id) => area_geom(board.area(id)?, adv).title,
         EditTarget::TodoText(id, r) => area_geom(board.area(id)?, adv).rows.get(r)?.text,
         EditTarget::TodoBody(id, r) => {
-            area_geom(board.area(id)?, adv).rows.get(r)?.body.as_ref()?.rect
+            area_geom(board.area(id)?, adv)
+                .rows
+                .get(r)?
+                .body
+                .as_ref()?
+                .rect
         }
         EditTarget::NoteTitle(id) => note_geom(board.note(id)?, adv).title,
         EditTarget::NoteBody(id) => note_geom(board.note(id)?, adv).body.rect,
@@ -1410,8 +1415,7 @@ impl Editor {
         let Some(text) = text_of(board, target) else {
             return false;
         };
-        let Some((t, nsel, ncaret)) =
-            crate::md::apply(text, sel, caret, op, target.multiline())
+        let Some((t, nsel, ncaret)) = crate::md::apply(text, sel, caret, op, target.multiline())
         else {
             return false;
         };
@@ -1493,7 +1497,11 @@ impl Editor {
         self.history.record(board, None);
         let (mut x, mut y) = (wx, wy);
         // Pasting twice at the same spot staggers the copies instead of stacking them.
-        while board.texts.iter().any(|t| (t.x - x).abs() < 1.0 && (t.y - y).abs() < 1.0) {
+        while board
+            .texts
+            .iter()
+            .any(|t| (t.x - x).abs() < 1.0 && (t.y - y).abs() < 1.0)
+        {
             (x, y) = (x + 24.0, y + 24.0);
         }
         let id = match tmpl {
@@ -3297,7 +3305,10 @@ mod tests {
         assert!(e.format_text(&mut b, id, FmtBtn::Bold));
         assert!(e.format_text(&mut b, id, FmtBtn::Size(crate::board::TextSize::Title)));
         assert!(e.format_text(&mut b, id, FmtBtn::Color(3)));
-        assert!(!e.format_text(&mut b, id, FmtBtn::Color(3)), "no-op is not an undo step");
+        assert!(
+            !e.format_text(&mut b, id, FmtBtn::Color(3)),
+            "no-op is not an undo step"
+        );
         let t = b.text(id).unwrap();
         assert!(t.bold && t.size == crate::board::TextSize::Title && t.color == 3);
         assert_eq!(t.style(), Style::Free(crate::board::TextSize::Title, true));
@@ -3390,7 +3401,10 @@ mod tests {
         let tmpl = b.text(id).unwrap().clone();
         let a = e.paste_text_box(&mut b, Some(&tmpl), "", (300.0, 200.0));
         let p = b.text(a).unwrap();
-        assert_eq!((p.text.as_str(), p.bold, p.color, p.group), ("styled", true, 2, 0));
+        assert_eq!(
+            (p.text.as_str(), p.bold, p.color, p.group),
+            ("styled", true, 2, 0)
+        );
         assert_eq!((p.x, p.y), (300.0, 200.0));
         assert_eq!(e.selected, Some(Sel::Text(a)));
         let c2 = e.paste_text_box(&mut b, None, "plain\ntext", (300.0, 200.0));

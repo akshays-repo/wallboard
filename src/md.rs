@@ -99,7 +99,9 @@ pub fn parse_line(line: &str) -> MdLine {
 }
 
 fn starts(c: &[char], k: usize, m: &str) -> bool {
-    m.chars().enumerate().all(|(i, mc)| c.get(k + i) == Some(&mc))
+    m.chars()
+        .enumerate()
+        .all(|(i, mc)| c.get(k + i) == Some(&mc))
 }
 
 /// Index of the next `m` at or after `from` (a single-char marker must not be part of a pair).
@@ -153,8 +155,18 @@ pub struct Cs {
 impl Cs {
     /// Same look as `o` (so both can be drawn in one run).
     pub fn same_run(&self, o: &Cs) -> bool {
-        (self.bold, self.italic, self.strike, self.code, self.heading, self.quote, self.done, self.dim)
-            == (o.bold, o.italic, o.strike, o.code, o.heading, o.quote, o.done, o.dim)
+        (
+            self.bold,
+            self.italic,
+            self.strike,
+            self.code,
+            self.heading,
+            self.quote,
+            self.done,
+            self.dim,
+        ) == (
+            o.bold, o.italic, o.strike, o.code, o.heading, o.quote, o.done, o.dim,
+        )
     }
 }
 
@@ -271,7 +283,11 @@ pub fn block_prefix(line: &[char]) -> (Block, usize, usize) {
     let lead = line.iter().take_while(|c| **c == ' ').count();
     let rest = &line[lead..];
     let compact: Vec<char> = rest.iter().copied().filter(|c| *c != ' ').collect();
-    if compact.len() >= 3 && ['-', '*', '_'].iter().any(|m| compact.iter().all(|c| c == m)) {
+    if compact.len() >= 3
+        && ['-', '*', '_']
+            .iter()
+            .any(|m| compact.iter().all(|c| c == m))
+    {
         return (Block::Rule, 0, line.len());
     }
     let hashes = rest.iter().take_while(|c| **c == '#').count();
@@ -366,7 +382,9 @@ pub fn char_styles(text: &str, blocks: bool) -> Vec<Cs> {
 
 /// True if rendering `text` as Markdown would look different from the raw text.
 pub fn has_markup(text: &str, blocks: bool) -> bool {
-    char_styles(text, blocks).iter().any(|c| *c != Cs::default())
+    char_styles(text, blocks)
+        .iter()
+        .any(|c| *c != Cs::default())
 }
 
 /// How many times `ch` repeats going left from `at` (exclusive) / right from `at` (inclusive).
@@ -466,7 +484,9 @@ pub fn apply(
 ) -> Option<Applied> {
     let (t, na, nb, new_caret) = match op {
         MdOp::Wrap(m) => {
-            let (a, b) = sel.or_else(|| word_at(text, caret)).unwrap_or((caret, caret));
+            let (a, b) = sel
+                .or_else(|| word_at(text, caret))
+                .unwrap_or((caret, caret));
             let (t, na, nb) = toggle_wrap(text, a, b, m);
             let nc = if sel.is_some() {
                 nb
@@ -509,7 +529,12 @@ pub fn toggle_prefix(text: &str, a: usize, b: usize, kind: LineKind) -> (String,
             starts_at.push(i + 1);
         }
     }
-    let line_end = |s: usize| c[s..].iter().position(|x| *x == '\n').map_or(c.len(), |p| s + p);
+    let line_end = |s: usize| {
+        c[s..]
+            .iter()
+            .position(|x| *x == '\n')
+            .map_or(c.len(), |p| s + p)
+    };
     let touched: Vec<usize> = starts_at
         .iter()
         .copied()
@@ -609,7 +634,12 @@ pub fn block_size(block: Block, base: TextSize) -> TextSize {
 }
 
 /// Lay out `text` as Markdown for a box of `size` (`bold` makes everything bold).
-pub fn layout(text: &str, size: TextSize, bold: bool, adv: &dyn Fn(Style, char) -> f32) -> MdLayout {
+pub fn layout(
+    text: &str,
+    size: TextSize,
+    bold: bool,
+    adv: &dyn Fn(Style, char) -> f32,
+) -> MdLayout {
     let mut lines = Vec::new();
     let (mut y, mut w) = (0.0_f32, 0.0_f32);
     for src in text.split('\n') {
@@ -717,10 +747,7 @@ mod tests {
             code: true,
             ..sp("e*f")
         };
-        assert_eq!(
-            s,
-            vec![sp("a "), b, sp(" "), c, sp(" "), d, sp(" "), e]
-        );
+        assert_eq!(s, vec![sp("a "), b, sp(" "), c, sp(" "), d, sp(" "), e]);
         // Unclosed or spaced markers stay literal; snake_case is not italic; escapes work.
         assert_eq!(inline("2 * 3 = 6"), vec![sp("2 * 3 = 6")]);
         assert_eq!(inline("**open"), vec![sp("**open")]);
@@ -728,7 +755,10 @@ mod tests {
         assert_eq!(inline(r"\*not\*"), vec![sp("*not*")]);
         // Nested: bold italic.
         let bi = inline("***x***");
-        assert!(bi.iter().any(|s| s.text == "x" && s.bold && s.italic), "{bi:?}");
+        assert!(
+            bi.iter().any(|s| s.text == "x" && s.bold && s.italic),
+            "{bi:?}"
+        );
     }
 
     #[test]
@@ -755,9 +785,18 @@ mod tests {
 
     #[test]
     fn wrapping_a_selection_toggles_markers() {
-        assert_eq!(toggle_wrap("make bold", 5, 9, "**"), ("make **bold**".into(), 7, 11));
-        assert_eq!(toggle_wrap("make **bold**", 7, 11, "**"), ("make bold".into(), 5, 9));
-        assert_eq!(toggle_wrap("make **bold**", 5, 13, "**"), ("make bold".into(), 5, 9));
+        assert_eq!(
+            toggle_wrap("make bold", 5, 9, "**"),
+            ("make **bold**".into(), 7, 11)
+        );
+        assert_eq!(
+            toggle_wrap("make **bold**", 7, 11, "**"),
+            ("make bold".into(), 5, 9)
+        );
+        assert_eq!(
+            toggle_wrap("make **bold**", 5, 13, "**"),
+            ("make bold".into(), 5, 9)
+        );
         // Italic inside bold is added, not mistaken for the bold markers.
         assert_eq!(toggle_wrap("**b**", 2, 3, "*"), ("***b***".into(), 3, 4));
         assert_eq!(toggle_wrap("***b***", 3, 4, "*"), ("**b**".into(), 2, 3));
@@ -768,8 +807,14 @@ mod tests {
 
     #[test]
     fn line_prefixes_toggle_and_cycle() {
-        assert_eq!(toggle_prefix("one\ntwo", 5, 5, LineKind::Bullet), ("one\n- two".into(), 7, 7));
-        assert_eq!(toggle_prefix("one\n- two", 7, 7, LineKind::Bullet), ("one\ntwo".into(), 5, 5));
+        assert_eq!(
+            toggle_prefix("one\ntwo", 5, 5, LineKind::Bullet),
+            ("one\n- two".into(), 7, 7)
+        );
+        assert_eq!(
+            toggle_prefix("one\n- two", 7, 7, LineKind::Bullet),
+            ("one\ntwo".into(), 5, 5)
+        );
         assert_eq!(
             toggle_prefix("a\nb", 0, 3, LineKind::Task),
             ("- [ ] a\n- [ ] b".into(), 6, 15)
@@ -781,7 +826,10 @@ mod tests {
         let (t, _, _) = toggle_prefix("### x", 0, 0, LineKind::Heading);
         assert_eq!(t, "x");
         // A bullet becomes a task in place.
-        assert_eq!(toggle_prefix("- x", 3, 3, LineKind::Task), ("- [ ] x".into(), 7, 7));
+        assert_eq!(
+            toggle_prefix("- x", 3, 3, LineKind::Task),
+            ("- [ ] x".into(), 7, 7)
+        );
     }
 
     #[test]
