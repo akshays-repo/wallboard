@@ -190,6 +190,8 @@ pub struct Editor {
     pub extra: Vec<Sel>,
     /// Shift is held (set by the app).
     pub shift: bool,
+    /// Space is held outside text editing (set by the app): a left drag pans from anywhere.
+    pub hand: bool,
     /// Other end of the text selection (the caret is the moving end). None: nothing selected.
     anchor: Option<usize>,
     pub editing: Option<Edit>,
@@ -296,6 +298,7 @@ impl Editor {
             selected: None,
             extra: Vec::new(),
             shift: false,
+            hand: false,
             anchor: None,
             editing: None,
             drag: Drag::None,
@@ -624,6 +627,12 @@ impl Editor {
                 true
             }
             Button::Right => self.right_press(board, wx, wy, adv),
+            Button::Left if self.hand && self.editing.is_none() => {
+                // Whatever is under the pointer is left alone, whichever tool is armed.
+                self.last_click = None;
+                self.drag = Drag::Pan { last: p };
+                true
+            }
             Button::Left => self.left_press(board, cam, p, (wx, wy), time, adv),
         }
     }
@@ -2474,6 +2483,37 @@ mod tests {
         let a1 = b.add_area(100.0, 100.0);
         let a2 = b.add_area(600.0, 100.0);
         (Editor::new(), b, a1, a2)
+    }
+
+    #[test]
+    fn space_drag_pans_from_anywhere_without_touching_the_board() {
+        let (mut e, mut b, ..) = two_empty_areas();
+        let before: Vec<(f32, f32)> = b.areas.iter().map(|a| (a.x, a.y)).collect();
+        let on_card = centre(area_geom(&b.areas[0], A).card);
+        e.hand = true;
+        for tool in [Tool::Select, Tool::Pen, Tool::Eraser, Tool::Note] {
+            e.set_tool(&mut b, tool);
+            let mut c = cam();
+            e.press(&mut b, &c, on_card, Button::Left, 0, A);
+            e.motion(&mut b, &mut c, (on_card.0 + 40.0, on_card.1 - 25.0));
+            e.release(&mut b, A);
+            assert_eq!((c.x, c.y), (-40.0, 25.0), "{tool:?}: content follows");
+            assert_eq!(e.selected, None, "{tool:?}: nothing gets selected");
+            assert!(e.editing.is_none());
+        }
+        let after: Vec<(f32, f32)> = b.areas.iter().map(|a| (a.x, a.y)).collect();
+        assert_eq!(before, after);
+        assert!(b.strokes.is_empty() && b.notes.is_empty());
+        assert!(!e.take_modified(), "panning is not a board change");
+
+        // Without Space the same drag on empty canvas selects and leaves the view alone.
+        e.hand = false;
+        e.set_tool(&mut b, Tool::Select);
+        let mut c = cam();
+        e.press(&mut b, &c, (20.0, 20.0), Button::Left, 5000, A);
+        e.motion(&mut b, &mut c, (500.0, 140.0));
+        e.release(&mut b, A);
+        assert_eq!((c.x, c.y), (0.0, 0.0));
     }
 
     #[test]

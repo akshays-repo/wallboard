@@ -1,6 +1,7 @@
 //! wallboard: a life-OS home screen on the niri background layer.
 //!
-//! Canvas: scroll pans, Ctrl+scroll zooms at the cursor, drag empty space or middle-drag pans.
+//! Canvas: scroll, middle-drag, Space+drag or the arrow keys pan; Ctrl+scroll zooms at the
+//! cursor; dragging empty space draws a selection box.
 //!
 //! Keys (when not typing): `1`-`9` jump to an area, `C` capture a todo into Inbox, `0` fit
 //! everything, `+`/`-` zoom, `L` dark/light, `B` cycle the background (colours, then your
@@ -92,6 +93,9 @@ const PX_PER_NOTCH: f32 = 15.0;
 /// A real mouse-wheel notch pans this many px (smooth/touchpad scroll is used as is).
 const PAN_PER_NOTCH: f32 = 60.0;
 const ZOOM_PER_NOTCH: f32 = 1.1;
+/// Screen px an arrow key pans per press or repeat (Shift: this many times further).
+const PAN_PER_KEY: f32 = 80.0;
+const PAN_KEY_FAST: f32 = 4.0;
 /// Margin (screen px) around everything when fitting the view.
 const FIT_MARGIN: f32 = 60.0;
 /// Do not zoom in past this when jumping to an area.
@@ -977,6 +981,13 @@ impl App {
         self.request_redraw();
     }
 
+    /// Move the content by a screen-space distance.
+    fn pan_view(&mut self, dx: f32, dy: f32) {
+        self.camera.pan_by_screen(dx, dy);
+        self.mark_dirty_for_save();
+        self.request_redraw();
+    }
+
     /// `C`: a new todo in Inbox, from anywhere.
     fn capture(&mut self) {
         if self.board.areas.is_empty() {
@@ -1626,10 +1637,27 @@ impl App {
             }
             return;
         }
-        if repeat || ctrl || self.mods.alt || self.mods.logo {
+        if ctrl || self.mods.alt || self.mods.logo {
+            return;
+        }
+        // Panning comes before the repeat check so that a held arrow keeps moving.
+        let arrow = match ev.keysym {
+            Keysym::Left => Some((1.0, 0.0)),
+            Keysym::Right => Some((-1.0, 0.0)),
+            Keysym::Up => Some((0.0, 1.0)),
+            Keysym::Down => Some((0.0, -1.0)),
+            _ => None,
+        };
+        if let Some((x, y)) = arrow {
+            let fast = if self.mods.shift { PAN_KEY_FAST } else { 1.0 };
+            self.pan_view(x * PAN_PER_KEY * fast, y * PAN_PER_KEY * fast);
+            return;
+        }
+        if repeat {
             return;
         }
         match ev.keysym {
+            Keysym::space => self.editor.hand = true,
             Keysym::_1
             | Keysym::_2
             | Keysym::_3
@@ -2005,6 +2033,8 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         if self.layer.wl_surface() == surface {
+            // The Space release will go elsewhere.
+            self.editor.hand = false;
             self.log(format_args!("[focus] keyboard LEAVE"));
         }
     }
@@ -2034,8 +2064,11 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        ev: KeyEvent,
     ) {
+        if ev.keysym == Keysym::space {
+            self.editor.hand = false;
+        }
     }
     fn update_modifiers(
         &mut self,
@@ -2113,7 +2146,8 @@ impl PointerHandler for App {
                             self.detail_click(pos);
                         }
                     } else if let Some(b) = b {
-                        let on_bar = if b == Button::Left {
+                        let panning = self.editor.hand && self.editor.editing.is_none();
+                        let on_bar = if b == Button::Left && !panning {
                             self.text_bar_click(pos)
                         } else {
                             None

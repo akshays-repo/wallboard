@@ -55,7 +55,9 @@ has keyboard focus. Quit with `Ctrl+Q`.
 |---|---|
 | Scroll | pan (Shift+scroll: sideways) |
 | Ctrl+scroll | zoom around the cursor |
-| Drag empty space, or middle-drag | pan |
+| Middle-drag, or **Space** + drag | pan (Space + drag works over cards too and leaves them alone) |
+| Drag the empty part of a group | pan |
+| Drag empty space | draw a selection box |
 | Drag a group by its title | move it |
 | Double-click empty space | new group |
 | Double-click a title | rename it |
@@ -74,6 +76,8 @@ has keyboard focus. Quit with `Ctrl+Q`.
 | `C` | capture a new todo into Inbox, from anywhere |
 | `0` | fit everything on screen |
 | `+` / `-` | zoom |
+| Arrow keys | pan (hold to keep moving; with Shift, four times as far) |
+| `Space` + drag | pan with the left button |
 | `L` / `Shift+L` | dark / light; open the **theme picker** (also the half-moon button on the right menu): Dark, Light, Aurora, Neon, Blueprint, Paper, Brutal. Hovering any toolbar, menu or chip button highlights it |
 | `B` | cycle the background: theme colour, six colours, then each wallpaper |
 | `F` / `Shift+F` | pick the wallpaper folder in a dialog (needs `zenity`; else it opens the folder) / open it in the file manager |

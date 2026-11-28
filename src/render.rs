@@ -2681,7 +2681,7 @@ const HELP_RIGHT: [(&str, &str); 22] = [
     ("Ctrl+Left/Right", "Previous / next space"),
     ("Double-click", "Edit / new group"),
     ("Right-click", "Remove item"),
-    ("Scroll / mid-drag", "Pan the canvas"),
+    ("Space+drag / mid-drag", "Pan (also scroll / arrows)"),
     ("Drag empty space", "Select items to group/delete"),
     ("Top menu +", "New space (dbl-click name: rename)"),
     ("Ctrl+scroll", "Zoom"),

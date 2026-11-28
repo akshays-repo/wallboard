@@ -430,11 +430,21 @@ def main_session(data):
         check("clicking it never starts editing", s.state()["editing"] is None)
         s.key("0")
         cam = s.state()["camera"]
-        # drag on empty canvas (free area) to pan
+        # hold Space and drag to pan
+        s.kb.emit(EV_KEY, KEYS["space"], 1); s.kb.sync(); s.pump(0.1)
         s.drag(sw * 0.7, sh * 0.9, sw * 0.7 - 80, sh * 0.9 - 30, steps=10)
+        s.kb.emit(EV_KEY, KEYS["space"], 0); s.kb.sync(); s.pump(0.1)
         cam2 = s.state()["camera"]
-        check("dragging empty canvas pans (content follows the pointer)", near(cam2["x"] - cam["x"], 80 / cam["zoom"], 2) and near(cam2["y"] - cam["y"], 30 / cam["zoom"], 2),
+        check("Space+drag pans (content follows the pointer)", near(cam2["x"] - cam["x"], 80 / cam["zoom"], 2) and near(cam2["y"] - cam["y"], 30 / cam["zoom"], 2),
               f"d=({cam2['x']-cam['x']:.1f},{cam2['y']-cam['y']:.1f})")
+        s.key("right")
+        cam3 = s.state()["camera"]
+        check("the right arrow pans the view right", near(cam3["x"] - cam2["x"], 80 / cam2["zoom"], 2) and near(cam3["y"], cam2["y"], 0.01),
+              f"d=({cam3['x']-cam2['x']:.1f},{cam3['y']-cam2['y']:.1f})")
+        s.key("down", shift=True)
+        cam4 = s.state()["camera"]
+        check("Shift+down arrow pans four times as far", near(cam4["y"] - cam3["y"], 320 / cam3["zoom"], 4) and near(cam4["x"], cam3["x"], 0.01),
+              f"d=({cam4['x']-cam3['x']:.1f},{cam4['y']-cam3['y']:.1f})")
         s.key("0")
         st = s.state()
         inside = all(
